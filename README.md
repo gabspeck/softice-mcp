@@ -60,6 +60,10 @@ Inspection: `registers`, `read_memory`, `disassemble`, `eval_expr`,
 `addr_context`, `module_info`.
 Breakpoints: `bp_set`, `bp_list`, `bp_mutate`.
 
+Structured tools auto-pop SoftICE (Ctrl-D) on demand, so `popup` is only
+needed when you want to break in without issuing a command. `resume` stays
+explicit — always call it before ending your turn.
+
 `send_keys` is the unconditional byte-level escape hatch — use it for anything
 the typed tools don't cover (arrow-key navigation, pager dismissal, function
 keys, chained Ctrl-sequences).

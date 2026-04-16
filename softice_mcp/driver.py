@@ -51,6 +51,7 @@ class SoftICEDriver:
         self._path: str | None = None
         self._sice: SoftICE | None = None
         self._bounds: tuple[int, int] = DEFAULT_COMMAND_BOUNDS
+        self._popped_in: bool | None = None
 
     # ---- lifecycle ---------------------------------------------------
 
@@ -71,6 +72,7 @@ class SoftICEDriver:
         sice.open()
         self._sice = sice
         self._bounds = DEFAULT_COMMAND_BOUNDS
+        self._popped_in = None
         return {"path": path, "connected": True}
 
     def ensure_open(self) -> SoftICE:
@@ -93,6 +95,7 @@ class SoftICEDriver:
                 self._sice.close()
         self._sice = None
         self._path = None
+        self._popped_in = None
         return {"was_open": had}
 
     def _retry_once(self, method: str, *args: Any, **kwargs: Any) -> Any:
@@ -127,7 +130,12 @@ class SoftICEDriver:
         raw = b""
         if drain_timeout > 0:
             raw = self._retry_once("drain", drain_timeout, settle)
-        return self._snapshot(raw)
+        snap = self._snapshot(raw)
+        if drain_timeout <= 0:
+            # No drain ran, so _snapshot's popped_in reflects pre-keypress
+            # state. The user's bytes may toggle it (Ctrl-D, `G`); re-probe.
+            self._popped_in = None
+        return snap
 
     def raw_cmd(self, line: str, timeout: float = 1.5) -> dict[str, Any]:
         raw = self._retry_once("cmd", line, timeout=timeout)
@@ -145,13 +153,31 @@ class SoftICEDriver:
         s = self.ensure_open()
         rows = s.render()
         bounds = detect_command_bounds(rows, self._bounds)
+        popped_in = detect_popped_in(rows, bounds)
+        self._popped_in = popped_in
         return {
             "raw": raw,
             "raw_rows": rows,
             "cursor": [s.screen.cursor.y, s.screen.cursor.x],
             "bounds": list(bounds),
-            "popped_in": detect_popped_in(rows, bounds),
+            "popped_in": popped_in,
         }
+
+    def ensure_popped(self, timeout: float = 1.5) -> bool:
+        """Pop SoftICE if currently detached. Returns True if Ctrl-D was sent.
+
+        Ctrl-D is a toggle (si30ug.pdf), so a blind send while popped would
+        resume. Trust a cached True to skip the probe; otherwise drain (which
+        also refreshes the popped_in cache via _snapshot) and only send Ctrl-D
+        when genuinely detached.
+        """
+        if self._popped_in is True:
+            return False
+        if self.drain(timeout=0.1, settle=0.05)["popped_in"]:
+            return False
+        self._retry_once("popup", timeout=timeout)
+        self._popped_in = True
+        return True
 
     # ---- window management ------------------------------------------
 
@@ -197,6 +223,7 @@ class SoftICEDriver:
         expand_window: bool = False,
     ) -> dict[str, Any]:
         """Send a command, extract its output, auto-page through ``More?``."""
+        self.ensure_popped()
         pre_rows = self.ensure_open().render()
         with self._window_context(expand_window):
             raw = bytearray()

@@ -297,6 +297,7 @@ class MCPServer:
     # ---- inspection ---------------------------------------------
 
     def _tool_registers(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._driver.ensure_popped()
         snap = self._driver.drain(timeout=0.3)
         parsed = parse_register_dump(snap["raw_rows"])
         if not parsed["parsed"]:
@@ -336,8 +337,20 @@ class MCPServer:
 
     def _tool_addr_context(self, args: dict[str, Any]) -> dict[str, Any]:
         name = args.get("name")
-        line = "ADDR" if not name else f"ADDR {str(name).strip()}"
-        snap = self._driver.cmd_with_extract(line, timeout=2.0, expand_window=True)
+        if name:
+            target = str(name).strip()
+            snap = self._driver.cmd_with_extract(
+                f"ADDR {target}", timeout=2.0, expand_window=False
+            )
+            # A successful switch is silent — echo + fresh prompt, which the
+            # extractor trims to []. Any output here is SoftICE complaining.
+            message = " ".join(s for s in (r.strip() for r in snap["command_rows"]) if s)
+            if message:
+                return _parsed_envelope(
+                    snap, parsed=None, parse_error="switch_failed", note=message,
+                )
+            return _parsed_envelope(snap, parsed={"switched_to": target})
+        snap = self._driver.cmd_with_extract("ADDR", timeout=2.0, expand_window=True)
         parsed = parse_addr_table(snap["command_rows"])
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
@@ -584,7 +597,7 @@ class MCPServer:
         return [
             self._tool(
                 "connect",
-                "Open a SoftICE serial PTY. Call this once before any other tool — subsequent commands reuse the connection. `path` is the host-side PTY symlink created by `tools/start_softice_bridge.sh` (typically `/tmp/softice_host`). Calling `connect` again replaces the existing connection.",
+                "Open a SoftICE serial PTY. Call this once before any other tool — subsequent commands reuse the connection and auto-pop SoftICE (Ctrl-D) when needed. `path` is the host-side PTY symlink created by `tools/start_softice_bridge.sh` (typically `/tmp/softice_host`). Calling `connect` again replaces the existing connection.",
                 {
                     "path": {
                         "type": "string",
@@ -595,7 +608,7 @@ class MCPServer:
             ),
             self._tool(
                 "popup",
-                "Ctrl-D into SoftICE to break over the running VM. Returns the rendered screen. Requires a prior `connect`.",
+                "Ctrl-D into SoftICE to break over the running VM. Usually unnecessary — structured tools auto-pop on demand. Use this when you want to pop explicitly without issuing a command.",
                 {"timeout": {"type": "number"}},
                 [],
             ),
