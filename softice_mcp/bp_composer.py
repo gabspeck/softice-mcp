@@ -1,9 +1,10 @@
 """Build a SoftICE breakpoint command line from structured arguments.
 
 Covers BPX (execution), BPM[size] (memory with size+verb), BPIO (I/O port
-R/W/RW), and BPINT (interrupt number). Supports the IF/DO suffix shared by
-all four, and an optional ``context`` that prepends ``ADDR <proc>;`` so the
-breakpoint arms in the correct address space (see feedback_softice_addr_before_bpx).
+R/W/RW), and BPINT (interrupt number), plus the IF/DO suffix shared by all
+four. Context switching (``ADDR <name>``) is a separate helper because
+SoftICE 3.x rejects the compound ``ADDR <name>; BPX ...`` form with
+``Invalid Context Handle`` — the switch has to commit before BPX runs.
 
 Refusal / validation:
 - ``actions`` are joined with ``;`` inside ``DO "..."``. Raw double-quotes or
@@ -79,15 +80,18 @@ def _format_condition(condition: str | None) -> str:
     return f" IF ({cond})" if not (cond.startswith("(") and cond.endswith(")")) else f" IF {cond}"
 
 
-def _prefix_context(context: str | None) -> str:
-    if context is None:
-        return ""
+def compose_addr_switch(context: str) -> str:
+    """Validate ``context`` and render the ``ADDR <name>`` switch command.
+
+    Must be issued as its own command before the BPX/BPM/etc — SoftICE 3.x
+    rejects the ``ADDR x; BPX y`` compound with ``Invalid Context Handle``.
+    """
     if not isinstance(context, str) or not context.strip():
         raise ValueError("context must be a non-empty string")
     ctx = context.strip()
     if any(c in ctx for c in ";\n\r\""):
         raise ValueError("context must not contain separators or quotes")
-    return f"ADDR {ctx}; "
+    return f"ADDR {ctx}"
 
 
 def compose_bp(
@@ -100,19 +104,17 @@ def compose_bp(
     intno: int | None = None,
     condition: str | None = None,
     actions: Iterable[str] | None = None,
-    context: str | None = None,
 ) -> str:
     k = kind.lower().strip()
     if k not in VALID_KINDS:
         raise ValueError(f"kind must be one of {sorted(VALID_KINDS)}, got {kind!r}")
 
-    prefix = _prefix_context(context)
     suffix = _format_condition(condition) + _format_actions(actions)
 
     if k == "bpx":
         if address is None:
             raise ValueError("bpx requires address")
-        return f"{prefix}BPX {format_address(address)}{suffix}"
+        return f"BPX {format_address(address)}{suffix}"
 
     if k == "bpm":
         if address is None:
@@ -121,9 +123,7 @@ def compose_bp(
             raise ValueError(f"bpm requires size in {sorted(VALID_BPM_SIZES)}")
         if verb is None or verb.lower() not in VALID_BPM_VERBS:
             raise ValueError(f"bpm requires verb in {sorted(VALID_BPM_VERBS)}")
-        return (
-            f"{prefix}BPM{size.upper()} {format_address(address)} {verb.upper()}{suffix}"
-        )
+        return f"BPM{size.upper()} {format_address(address)} {verb.upper()}{suffix}"
 
     if k == "bpio":
         if port is None:
@@ -132,14 +132,14 @@ def compose_bp(
             raise ValueError("bpio port must be an int in [0, 0xFFFF]")
         if verb is None or verb.lower() not in VALID_BPIO_VERBS:
             raise ValueError(f"bpio requires verb in {sorted(VALID_BPIO_VERBS)}")
-        return f"{prefix}BPIO {port:X} {verb.upper()}{suffix}"
+        return f"BPIO {port:X} {verb.upper()}{suffix}"
 
     # bpint
     if intno is None:
         raise ValueError("bpint requires intno")
     if not isinstance(intno, int) or isinstance(intno, bool) or intno < 0 or intno > 0xFF:
         raise ValueError("bpint intno must be an int in [0, 0xFF]")
-    return f"{prefix}BPINT {intno:X}{suffix}"
+    return f"BPINT {intno:X}{suffix}"
 
 
 def compose_bp_mutate(op: str, index: int | str) -> str:

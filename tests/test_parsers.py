@@ -63,28 +63,119 @@ class TestExtractCommandOutput:
                 "",
             ]
         )
-        out, err = extract_command_output(rows, "? 1+1", (17, 24), cursor_row=19)
+        out, err, _ = extract_command_output(rows, "? 1+1", (17, 24), cursor_row=19)
         assert err is None
         assert out == ['  00000002  0000000002  "."']
 
     def test_prompt_not_found(self):
         rows = make_grid(["no prompt here"])
-        out, err = extract_command_output(rows, "X", (17, 24), cursor_row=20)
+        out, err, _ = extract_command_output(rows, "X", (17, 24), cursor_row=20)
         assert err == "prompt_not_found"
         assert out == []
 
     def test_trailing_blanks_stripped(self):
         rows = make_grid([":R", "EAX=0 EBX=0", "", "   ", ":", "", "", ""])
-        out, err = extract_command_output(rows, "R", (17, 24), cursor_row=21)
+        out, err, _ = extract_command_output(rows, "R", (17, 24), cursor_row=21)
         assert err is None
         assert out == ["EAX=0 EBX=0"]
 
     def test_empty_echo_still_works(self):
         """When paging continues, we feed '' as echo_line; extractor falls back."""
         rows = make_grid(["line1", "line2", "line3", ":", "", "", "", ""])
-        out, err = extract_command_output(rows, "", (17, 24), cursor_row=20)
+        out, err, _ = extract_command_output(rows, "", (17, 24), cursor_row=20)
         assert err is None
         assert out == ["line1", "line2", "line3"]
+
+    def test_echo_without_colon_prefix(self):
+        """Scrolled Command window sometimes loses the leading `:` on the echo
+        row; stripping to bare command text must still identify it as echo."""
+        rows = make_grid([" ADDR Explorer", ":", "", "", "", "", "", ""])
+        out, err, _ = extract_command_output(rows, "ADDR Explorer", (17, 24), cursor_row=18)
+        assert err is None
+        assert out == []
+
+    def test_expanded_window_ignores_stale_echoes(self):
+        """With the Code/Data panes hidden (WC+WD), the Command window spans
+        rows 4..24 and prior-command echoes stay visible in the top portion.
+        The extractor must anchor on the bottommost bare `:` prompt rather
+        than on a `:COMMAND` echo higher up."""
+        rows = [" " * 80 for _ in range(25)]
+        rows[4] = ":BC *".ljust(80)
+        rows[5] = ":ADDR Explorer".ljust(80)
+        rows[6] = ":WC".ljust(80)
+        rows[7] = ":WD".ljust(80)
+        rows[8] = ":BL".ljust(80)
+        rows[9] = "00) BPX 0030:00401000".ljust(80)
+        rows[10] = "01) BPX 0030:00402000".ljust(80)
+        rows[11] = ":".ljust(80)
+        rows[12] = "     Enter a command (H for help)             KERNEL32".ljust(80)
+        # cursor parked on the status bar — forces the walk to ignore it.
+        out, err, _ = extract_command_output(rows, "BL", (4, 24), cursor_row=12)
+        assert err is None
+        assert out == ["00) BPX 0030:00401000", "01) BPX 0030:00402000"]
+
+    def test_prefers_most_recent_echo(self):
+        """If two `:BL` echoes are visible (a prior BL scrolled but stayed
+        on-screen), the extractor must anchor on the more recent one so its
+        output is returned, not the older one's."""
+        rows = [" " * 80 for _ in range(25)]
+        rows[17] = ":BL".ljust(80)
+        rows[18] = "XX) OLD DATA".ljust(80)
+        rows[19] = ":".ljust(80)
+        rows[20] = ":BL".ljust(80)
+        rows[21] = "00) BPX 0030:00401000".ljust(80)
+        rows[22] = ":".ljust(80)
+        out, err, _ = extract_command_output(rows, "BL", (17, 24), cursor_row=22)
+        assert err is None
+        assert out == ["00) BPX 0030:00401000"]
+
+    def test_pager_marker_as_prompt(self):
+        """When SoftICE's pager is active, the bottom row shows `More?` (or
+        `press any key`) instead of a bare `:` prompt. The extractor must
+        accept that as a terminator so cmd_with_extract's paging loop gets
+        the current page's output."""
+        rows = make_grid(
+            [
+                ":BL",
+                "00) BPX 0030:00401000",
+                "01) BPX 0030:00402000",
+                "02) BPX 0030:00403000",
+                "03) BPX 0030:00404000",
+                "04) BPX 0030:00405000",
+                "05) BPX 0030:00406000",
+                "More?",
+            ]
+        )
+        out, err, _ = extract_command_output(rows, "BL", (17, 24), cursor_row=24)
+        assert err is None
+        assert out == [
+            "00) BPX 0030:00401000",
+            "01) BPX 0030:00402000",
+            "02) BPX 0030:00403000",
+            "03) BPX 0030:00404000",
+            "04) BPX 0030:00405000",
+            "05) BPX 0030:00406000",
+        ]
+
+    def test_prompt_not_found_when_cursor_mid_output(self):
+        """If the drain returned before SoftICE painted a fresh prompt or a
+        pager marker, the extractor must fail loudly rather than silently
+        anchoring on a `:COMMAND` echo higher up."""
+        rows = make_grid(
+            [
+                ":BL",
+                "00) BPX 0030:00401000",
+                "01) BPX 0030:00402000",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
+        out, err, _ = extract_command_output(rows, "BL", (17, 24), cursor_row=20)
+        assert err == "prompt_not_found"
+        assert out == []
 
 
 class TestDetectPoppedIn:
@@ -321,20 +412,47 @@ class TestParseBreakpointList:
 
 
 class TestParseAddrTable:
-    def test_basic(self):
+    def test_without_bold_flags_nothing_active(self):
+        # No bold info: parser returns contexts but can't identify active.
         rows = [
             "Handle  Owner",
             "  FFBEAE58  MSGSRV32",
-            "* FFBEAE90  EXPLORER",
+            "  FFBEAE90  EXPLORER",
             "  FFBEAEC8  DIRSRV",
         ]
         parsed = parse_addr_table(rows)
         assert parsed["parse_error"] is None
-        assert parsed["parsed"]["current"] == "EXPLORER"
+        assert parsed["parsed"]["current"] is None
         assert len(parsed["parsed"]["contexts"]) == 3
-        active = [c for c in parsed["parsed"]["contexts"] if c["active"]]
-        assert len(active) == 1
-        assert active[0]["owner"] == "EXPLORER"
+        assert all(not c["active"] for c in parsed["parsed"]["contexts"])
+
+    def test_bold_row_marks_active_and_sets_current(self):
+        # SoftICE bolds the whole active row — bold list is index-aligned
+        # with command_rows, so rows[i] bold <=> ctx for that row is active.
+        rows = [
+            "Handle  Owner",
+            "  FFBEAE58  MSGSRV32",
+            "  FFBEAE90  EXPLORER",
+            "  FFBEAEC8  DIRSRV",
+        ]
+        bold = [False, False, True, False]
+        parsed = parse_addr_table(rows, bold)
+        assert parsed["parsed"]["current"] == "EXPLORER"
+        actives = [c["owner"] for c in parsed["parsed"]["contexts"] if c["active"]]
+        assert actives == ["EXPLORER"]
+
+    def test_bold_list_shorter_than_rows_is_safe(self):
+        # Missing entries past the end of the bold list default to not-bold,
+        # without raising — covers a drift between command_rows and render_bold
+        # if the driver ever gets them out of sync.
+        rows = [
+            "Handle  Owner",
+            "  FFBEAE58  MSGSRV32",
+            "  FFBEAE90  EXPLORER",
+        ]
+        parsed = parse_addr_table(rows, [False, False])  # EXPLORER uncovered
+        assert parsed["parsed"]["current"] is None
+        assert all(not c["active"] for c in parsed["parsed"]["contexts"])
 
     def test_empty(self):
         parsed = parse_addr_table([])

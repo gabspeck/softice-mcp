@@ -122,6 +122,19 @@ class SoftICE:
     def render(self) -> list[str]:
         return [line.rstrip() for line in self.screen.display]
 
+    def render_bold(self) -> list[bool]:
+        """Per-row flag: True when any cell on that row is rendered bold.
+
+        SoftICE 4.2 bolds the active row in the ADDR table (and only that
+        row, within the table) — the parser uses this to flag `active`.
+        """
+        buf = self.screen.buffer
+        cols = self.screen.columns
+        return [
+            any(buf[y][x].bold for x in range(cols))
+            for y in range(self.screen.lines)
+        ]
+
 
 def _format_screen(rows: list[str]) -> str:
     width = max((len(r) for r in rows), default=0)

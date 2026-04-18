@@ -23,7 +23,7 @@ def extract_command_output(
     echo_line: str,
     bounds: tuple[int, int],
     cursor_row: int,
-) -> tuple[CommandRows, str | None]:
+) -> tuple[CommandRows, str | None, list[int]]:
     """Slice the Command window down to just the output of the last command.
 
     ``rows`` is the pyte 25-row grid. ``bounds`` is the inclusive top/bottom
@@ -31,39 +31,73 @@ def extract_command_output(
     Data/Code panes are hidden). ``cursor_row`` is pyte's Y after drain —
     SoftICE parks the cursor on the fresh prompt.
 
-    Returns (command_rows, parse_error). command_rows excludes the echo row
-    and the new prompt row, and trailing blank lines are dropped.
+    Returns (command_rows, parse_error, row_indices). command_rows excludes
+    the echo row and the new prompt row, trailing blank lines are dropped,
+    and row_indices holds the source grid index for each kept row so callers
+    can look up sibling attributes (boldness, colour) at the same coords.
     """
     top, bot = bounds
     top = max(0, top)
     bot = min(len(rows) - 1, bot)
     if top > bot:
-        return [], "bounds_invalid"
+        return [], "bounds_invalid", []
 
-    prompt_row = cursor_row if top <= cursor_row <= bot else bot
-    while prompt_row >= top:
-        row = rows[prompt_row]
-        if row.lstrip().startswith(":"):
+    # Anchor the prompt at the bottommost terminator. We deliberately ignore
+    # `cursor_row`: pyte doesn't reliably park on the bare `:` row, so
+    # walking up from the cursor can latch onto a `:COMMAND` echo (`:BL`,
+    # `:WD`) and treat it as the prompt — especially in an expanded Command
+    # window where prior-command echoes stay visible. Walking up from `bot`
+    # picks whatever is actually nearest the bottom of the pane.
+    prompt_row: int | None = None
+    for r in range(bot, top - 1, -1):
+        stripped = rows[r].strip()
+        if not stripped:
+            continue
+        if "Enter a command" in stripped:
+            continue
+        if "--------" in stripped:
+            continue
+        if stripped == ":":
+            prompt_row = r
             break
-        prompt_row -= 1
-    if prompt_row < top:
-        return [], "prompt_not_found"
+        if stripped.endswith("More?") or "press any key" in stripped.lower():
+            prompt_row = r
+            break
+        # First non-skippable row isn't a prompt or pager marker — SoftICE
+        # hasn't painted a fresh prompt yet. Fail loudly instead of silently
+        # latching onto a stale echo higher up.
+        break
+    if prompt_row is None:
+        return [], "prompt_not_found", []
 
+    # Echo search walks BACKWARD from the prompt so the most recent `:CMD`
+    # echo wins over stale ones. Pass 1 insists on an exact match (with or
+    # without the leading `:`) to reject accidental substring hits — a
+    # single-letter needle like `"R"` would otherwise false-match a register
+    # dump row containing `IDTR`. Pass 2 is the looser substring+`:` check,
+    # reached only if Pass 1 found nothing in the whole window.
     echo_row: int | None = None
     needle = echo_line.strip()
     if needle:
-        for r in range(top, prompt_row):
-            row = rows[r]
-            idx = row.find(needle)
-            if idx < 0:
-                continue
-            if ":" in row[:idx]:
+        colon_needle = f":{needle}"
+        for r in range(prompt_row - 1, top - 1, -1):
+            stripped = rows[r].strip()
+            if stripped == needle or stripped == colon_needle:
                 echo_row = r
                 break
+        if echo_row is None:
+            for r in range(prompt_row - 1, top - 1, -1):
+                row = rows[r]
+                idx = row.find(needle)
+                if idx < 0:
+                    continue
+                if ":" in row[:idx]:
+                    echo_row = r
+                    break
     # Fallback (and the continuation-page case): include everything between
     # the last separator row and the prompt. SoftICE's Command window scrolls
     # upward, so output sits above the prompt; the echo often gets overwritten
-    # by the result before we snapshot, so walking down-to-echo fails.
+    # by the result before we snapshot, so matching it fails.
     if echo_row is None:
         echo_row = top - 1
         for r in range(prompt_row - 1, top - 1, -1):
@@ -71,10 +105,12 @@ def extract_command_output(
                 echo_row = r
                 break
 
-    out = [rows[r].rstrip() for r in range(echo_row + 1, prompt_row)]
+    indices = list(range(echo_row + 1, prompt_row))
+    out = [rows[r].rstrip() for r in indices]
     while out and not out[-1].strip():
         out.pop()
-    return out, None
+        indices.pop()
+    return out, None, indices
 
 
 def _is_separator(row: str) -> bool:
@@ -414,29 +450,38 @@ def parse_breakpoint_list(command_rows: CommandRows) -> dict[str, Any]:
 # ---- address contexts ( ADDR ) ----------------------------------------
 
 
-def parse_addr_table(command_rows: CommandRows) -> dict[str, Any]:
+def parse_addr_table(
+    command_rows: CommandRows,
+    command_rows_bold: list[bool] | None = None,
+) -> dict[str, Any]:
+    # SoftICE bolds the active row in the ADDR table and only that row.
+    # `command_rows_bold[i]` should line up with `command_rows[i]`; when it's
+    # missing we just can't identify the active context and everything comes
+    # back `active=False, current=None`.
+    bold = command_rows_bold or []
     contexts: list[dict[str, Any]] = []
     current: str | None = None
     header_seen = False
-    for row in command_rows:
+    for i, row in enumerate(command_rows):
         stripped = row.strip()
         if not stripped:
             continue
         if not header_seen and ("Handle" in row or "Owner" in row):
             header_seen = True
             continue
-        active = stripped.startswith("*")
-        cleaned = stripped.lstrip("*").strip()
-        parts = cleaned.split()
+        parts = stripped.split()
         if len(parts) < 2:
             continue
-        owner = parts[-1]
         try:
             handle = int(parts[0], 16)
         except ValueError:
             continue
-        contexts.append({"handle": handle, "owner": owner, "active": active, "raw": cleaned})
-        if active:
+        active = bool(bold[i]) if i < len(bold) else False
+        owner = parts[-1]
+        contexts.append(
+            {"handle": handle, "owner": owner, "active": active, "raw": stripped}
+        )
+        if active and current is None:
             current = owner
     if not contexts:
         return {"parsed": None, "parse_error": "no_contexts", "rows": list(command_rows)}

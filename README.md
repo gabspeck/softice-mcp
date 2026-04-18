@@ -64,16 +64,25 @@ Structured tools auto-pop SoftICE (Ctrl-D) on demand, so `popup` is only
 needed when you want to break in without issuing a command. `resume` stays
 explicit — always call it before ending your turn.
 
-`send_keys` is the unconditional byte-level escape hatch — use it for anything
-the typed tools don't cover (arrow-key navigation, pager dismissal, function
-keys, chained Ctrl-sequences).
+`raw_cmd` and `send_keys` are escape hatches. `raw_cmd` runs an arbitrary
+SoftICE command line; `send_keys` writes raw bytes (arrow keys, ESC, function
+keys, chained Ctrl-sequences). Both bypass the typed tools' parsing and
+discipline — prefer a typed tool when one fits.
 
 ## Discipline
 
-Two rules baked into the tool descriptions:
+Three rules baked into the tool descriptions:
 
 1. For user-range breakpoint addresses (`0x00400000`–`0x7FFFFFFF`) pass
-   `context` to `bp_set` so the composer emits `ADDR <proc>; BPX …` on one
-   line — skipping this arms BPs against the wrong page table silently.
+   `context` to `bp_set` — the tool issues `ADDR <proc>` as its own command
+   before `BPX` (the `ADDR x; BPX y` compound is rejected by SoftICE 3.x
+   with `Invalid Context Handle`). Skipping `context` arms the BP against
+   whatever page table happens to be current.
 2. Always call `resume` before ending a turn. Leaving SoftICE popped freezes
    the VM for the next user interaction.
+3. Before reaching for `raw_cmd` or `send_keys`, state in one sentence why
+   the typed tool doesn't fit. These escape hatches skip structured parsing
+   and the discipline enforced by `bp_set`, `addr_context`, `step`, etc. —
+   use them for SoftICE commands without a wrapper (WHAT, BSTAT, TABLE) or
+   byte-level input (BH arrow-key navigation, pager dismissal), not as a
+   shortcut around typed tools.

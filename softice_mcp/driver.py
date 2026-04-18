@@ -229,17 +229,20 @@ class SoftICEDriver:
             raw = bytearray()
             raw.extend(self._retry_once("cmd", line, timeout=timeout))
             command_rows: list[str] = []
+            command_rows_bold: list[bool] = []
             parse_error: str | None = None
             steps = 0
             bounds = self._bounds
             while True:
                 s = self.ensure_open()
                 rows = s.render()
+                bold = s.render_bold()
                 bounds = detect_command_bounds(rows, self._bounds)
-                page_rows, parse_error = extract_command_output(
+                page_rows, parse_error, page_idx = extract_command_output(
                     rows, line if steps == 0 else "", bounds, s.screen.cursor.y
                 )
                 command_rows.extend(page_rows)
+                command_rows_bold.extend(bold[i] for i in page_idx)
                 if not has_more_pager(rows, bounds) or steps >= MAX_PAGER_STEPS:
                     break
                 raw.extend(self._retry_once("send_keys", b" ") or b"")
@@ -260,6 +263,7 @@ class SoftICEDriver:
             "cursor": cursor,
             "bounds": list(bounds),
             "command_rows": command_rows,
+            "command_rows_bold": command_rows_bold,
             "parse_error": parse_error,
             "popped_in": detect_popped_in(final_rows, detect_command_bounds(final_rows, self._bounds)),
             "pager_steps": steps,

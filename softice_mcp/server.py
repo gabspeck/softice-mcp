@@ -7,7 +7,12 @@ import sys
 import traceback
 from typing import Any
 
-from .bp_composer import compose_bp, compose_bp_mutate, format_address
+from .bp_composer import (
+    compose_addr_switch,
+    compose_bp,
+    compose_bp_mutate,
+    format_address,
+)
 from .driver import (
     SoftICEDriver,
     SoftICEIOError,
@@ -40,6 +45,16 @@ def _debug_log(message: str) -> None:
 
 def _encode_raw(raw: bytes) -> str:
     return raw[:512].hex() if raw else ""
+
+
+def _command_output_message(command_rows: list[str]) -> str:
+    """Collapse command_rows into a single-line error message, or "" if empty.
+
+    BPX/BPM/BPIO/BPINT and ADDR <name> are silent on success, so any content
+    in command_rows is SoftICE complaining (Invalid Context Handle, Syntax
+    error, Invalid Address, etc.).
+    """
+    return " ".join(s for s in (r.strip() for r in command_rows) if s)
 
 
 def _raw_envelope(
@@ -300,9 +315,17 @@ class MCPServer:
         self._driver.ensure_popped()
         snap = self._driver.drain(timeout=0.3)
         parsed = parse_register_dump(snap["raw_rows"])
-        if not parsed["parsed"]:
-            raise SoftICEStateError("Register pane not visible — SoftICE may not be popped in.")
-        return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
+        if parsed["parsed"]:
+            return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
+        # `WR` toggles the register window. Try up to twice: one toggle
+        # handles a hidden pane; two handles a pane that was on but only
+        # partially painted (first WR hides it, second forces a fresh paint).
+        for _ in range(2):
+            snap = self._driver.raw_cmd("WR", timeout=1.0)
+            parsed = parse_register_dump(snap["raw_rows"])
+            if parsed["parsed"]:
+                return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
+        raise SoftICEStateError("Register pane not visible — SoftICE may not be popped in.")
 
     def _tool_read_memory(self, args: dict[str, Any]) -> dict[str, Any]:
         address = self._require_address(args, "address")
@@ -322,9 +345,14 @@ class MCPServer:
         count = self._require_int(args, "count", default=8)
         if count < 1 or count > 128:
             raise ValueError("count must be in [1, 128]")
-        line = f"U {format_address(address)} L{count:X}"
+        # SoftICE's `L` is a byte length, not an instruction count. x86
+        # instructions are at most 15 bytes; ask for `count * 16` bytes so
+        # we're guaranteed at least `count` instructions, then truncate.
+        line = f"U {format_address(address)} L{count * 16:X}"
         snap = self._driver.cmd_with_extract(line, timeout=2.0, expand_window=True)
         parsed = parse_disasm(snap["command_rows"])
+        if parsed["parsed"]:
+            parsed["parsed"]["instructions"] = parsed["parsed"]["instructions"][:count]
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
     def _tool_eval_expr(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -342,16 +370,16 @@ class MCPServer:
             snap = self._driver.cmd_with_extract(
                 f"ADDR {target}", timeout=2.0, expand_window=False
             )
-            # A successful switch is silent — echo + fresh prompt, which the
-            # extractor trims to []. Any output here is SoftICE complaining.
-            message = " ".join(s for s in (r.strip() for r in snap["command_rows"]) if s)
+            message = _command_output_message(snap["command_rows"])
             if message:
                 return _parsed_envelope(
                     snap, parsed=None, parse_error="switch_failed", note=message,
                 )
             return _parsed_envelope(snap, parsed={"switched_to": target})
         snap = self._driver.cmd_with_extract("ADDR", timeout=2.0, expand_window=True)
-        parsed = parse_addr_table(snap["command_rows"])
+        parsed = parse_addr_table(
+            snap["command_rows"], snap.get("command_rows_bold")
+        )
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
     def _tool_module_info(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -374,7 +402,7 @@ class MCPServer:
         actions = args.get("actions")
         if actions is not None and not isinstance(actions, list):
             raise ValueError("actions must be an array of strings")
-        line = compose_bp(
+        bp_line = compose_bp(
             kind,
             address,
             size=args.get("size"),
@@ -383,21 +411,47 @@ class MCPServer:
             intno=args.get("intno"),
             condition=args.get("condition"),
             actions=actions,
-            context=args.get("context"),
         )
+        context = args.get("context")
+        addr_line: str | None = compose_addr_switch(context) if context else None
 
         note: str | None = None
         if kind in ("bpx", "bpm") and isinstance(address, int):
-            if 0x00400000 <= address <= 0x7FFFFFFF and not args.get("context"):
+            if 0x00400000 <= address <= 0x7FFFFFFF and not context:
                 note = REMINDER_ADDR
 
-        snap = self._driver.cmd_with_extract(line, timeout=2.0, expand_window=False)
+        # SoftICE 3.x rejects `ADDR x; BPX y` compound with Invalid Context
+        # Handle — switch has to commit before BPX runs. Issue as two commands.
+        if addr_line is not None:
+            addr_snap = self._driver.cmd_with_extract(addr_line, timeout=2.0)
+            addr_msg = _command_output_message(addr_snap["command_rows"])
+            if addr_msg:
+                return _parsed_envelope(
+                    addr_snap,
+                    parsed={"issued": [addr_line]},
+                    parse_error="addr_switch_failed",
+                    note=addr_msg,
+                )
+
+        snap = self._driver.cmd_with_extract(bp_line, timeout=2.0, expand_window=False)
+        # BPX/BPM/BPIO/BPINT are silent on success; non-empty output is SoftICE
+        # rejecting the command (e.g. "Invalid Address", "Syntax error").
+        bp_msg = _command_output_message(snap["command_rows"])
+        issued = [addr_line, bp_line] if addr_line else [bp_line]
+        if bp_msg:
+            return _parsed_envelope(
+                snap,
+                parsed={"issued": issued},
+                parse_error="bpx_rejected",
+                note=bp_msg,
+            )
+
         follow = self._driver.cmd_with_extract("BL", timeout=1.5, expand_window=True)
         parsed_bl = parse_breakpoint_list(follow["command_rows"])
         bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
         return _parsed_envelope(
             snap,
-            parsed={"issued": line, "breakpoints": bps},
+            parsed={"issued": issued, "breakpoints": bps},
             note=note,
         )
 
@@ -632,7 +686,7 @@ class MCPServer:
             ),
             self._tool(
                 "raw_cmd",
-                "Send an arbitrary SoftICE command line (CR appended). Use this for commands without a typed wrapper (WHAT, BSTAT, TABLE, custom chains)."
+                "Escape hatch: send an arbitrary SoftICE command line (CR appended). Prefer a typed tool (`step`, `read_memory`, `bp_set`, `addr_context`, `module_info`, `eval_expr`, `registers`, etc.) — they parse output into structured fields and enforce known-good discipline (e.g. splitting `ADDR; BPX`). Reach for `raw_cmd` only when no typed tool fits (WHAT, BSTAT, TABLE, exotic chains). State in one sentence why the typed path doesn't work before issuing."
                 + resume_hint,
                 {
                     "line": {"type": "string"},
@@ -646,7 +700,7 @@ class MCPServer:
             ),
             self._tool(
                 "send_keys",
-                "Write raw bytes to the PTY (no CR appended). Escapes supported: \\r \\n \\t \\e \\x04. Use for arrow-key navigation (BH list), ESC to dismiss pagers, function keys, chained Ctrl-sequences — anything the typed tools don't cover.",
+                "Escape hatch: write raw bytes to the PTY (no CR appended). Escapes supported: \\r \\n \\t \\e \\x04. Use only for byte-level input no other tool can produce — arrow-key navigation (BH list), ESC to dismiss pagers, function keys, chained Ctrl-sequences. For command lines use `raw_cmd`; for structured debugger ops use the typed tools. State in one sentence why no typed tool fits before issuing.",
                 {
                     "keys": {"type": "string"},
                     "drain_timeout": {"type": "number"},
@@ -704,7 +758,7 @@ class MCPServer:
             ),
             self._tool(
                 "addr_context",
-                "Show the address-context table (ADDR) or switch to a named process (ADDR <name>).",
+                "Show the address-context table (ADDR) or switch to a context (ADDR <target>). `name` accepts either a process name (e.g. `Explorer`) or a hex Handle from the table — use the handle when multiple rows share a name.",
                 {"name": {"type": "string"}},
                 [],
             ),

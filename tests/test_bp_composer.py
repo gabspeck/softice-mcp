@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from softice_mcp.bp_composer import (
+    compose_addr_switch,
     compose_bp,
     compose_bp_mutate,
     format_address,
@@ -63,20 +64,6 @@ class TestBpx:
             "bpx", 0x401000, condition="EAX==1", actions=["R", "DD ESP L10"]
         )
         assert line == 'BPX 401000 IF (EAX==1) DO "R;DD ESP L10"'
-
-    def test_with_context(self):
-        line = compose_bp("bpx", 0x401000, context="DIRSRV")
-        assert line == "ADDR DIRSRV; BPX 401000"
-
-    def test_context_with_condition_and_actions(self):
-        line = compose_bp(
-            "bpx",
-            0x401000,
-            condition="EAX==1",
-            actions=["R"],
-            context="DIRSRV",
-        )
-        assert line == 'ADDR DIRSRV; BPX 401000 IF (EAX==1) DO "R"'
 
     def test_missing_address_rejected(self):
         with pytest.raises(ValueError, match="requires address"):
@@ -164,14 +151,32 @@ class TestActionValidation:
             compose_bp("bpx", 0x401000, actions=["   "])
 
 
-class TestContextValidation:
-    def test_empty_context_rejected(self):
-        with pytest.raises(ValueError, match="non-empty"):
-            compose_bp("bpx", 0x401000, context="")
+class TestAddrSwitch:
+    def test_basic(self):
+        assert compose_addr_switch("DIRSRV") == "ADDR DIRSRV"
 
-    def test_context_with_semicolon_rejected(self):
+    def test_strips_whitespace(self):
+        assert compose_addr_switch("  Explorer  ") == "ADDR Explorer"
+
+    def test_empty_rejected(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            compose_addr_switch("")
+
+    def test_whitespace_only_rejected(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            compose_addr_switch("   ")
+
+    def test_semicolon_rejected(self):
         with pytest.raises(ValueError, match="separators"):
-            compose_bp("bpx", 0x401000, context="DIR;BAD")
+            compose_addr_switch("DIR;BAD")
+
+    def test_newline_rejected(self):
+        with pytest.raises(ValueError, match="separators"):
+            compose_addr_switch("DIR\nBAD")
+
+    def test_quote_rejected(self):
+        with pytest.raises(ValueError, match="separators"):
+            compose_addr_switch('DIR"BAD')
 
 
 class TestKindValidation:
