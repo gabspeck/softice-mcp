@@ -88,8 +88,6 @@ def _raw_envelope(
     }
     if note:
         env["note"] = note
-    elif env["popped_in"]:
-        env["note"] = REMINDER_RESUME
     if extra:
         env.update(extra)
     return env
@@ -106,9 +104,10 @@ def _parsed_envelope(
 
     Drops the 25-row grid, raw byte hex, cursor and bounds — the LLM has the
     parsed value, the rest is noise. On parse failure we put `command_rows`
-    and `raw_rows` back so the caller has a fallback path. `popped_in` and
-    the resume reminder always ride along because the LLM needs to know
-    whether to release the VM before ending its turn.
+    and `raw_rows` back so the caller has a fallback path. `popped_in` rides
+    along so the caller knows whether to resume before ending its turn; only
+    targeted `note`s (errors, one-shot warnings) are emitted — the resume
+    reminder sits in the tool descriptions, not every response.
     """
     env: dict[str, Any] = {
         "ok": parse_error is None,
@@ -124,8 +123,6 @@ def _parsed_envelope(
         env["pager_steps"] = pager
     if note:
         env["note"] = note
-    elif env["popped_in"]:
-        env["note"] = REMINDER_RESUME
     if parse_error is not None:
         env["command_rows"] = snapshot.get("command_rows", [])
         env["raw_rows"] = snapshot.get("raw_rows") or snapshot.get("final_rows") or []
@@ -254,14 +251,14 @@ class MCPServer:
     def _tool_popup(self, args: dict[str, Any]) -> dict[str, Any]:
         timeout = self._optional_float(args, "timeout", 1.5)
         snap = self._driver.popup(timeout=timeout or 1.5)
-        return _parsed_envelope(snap, parsed=None, note=REMINDER_RESUME)
+        return _parsed_envelope(snap, parsed=None)
 
     def _tool_resume(self, args: dict[str, Any]) -> dict[str, Any]:
         address = self._optional_address(args, "address")
         line = "G" if address is None else f"G {format_address(address)}"
         snap = self._driver.raw_cmd(line, timeout=1.0)
         snap["line"] = line
-        return _parsed_envelope(snap, parsed={"resumed": True}, note="SoftICE resumed.")
+        return _parsed_envelope(snap, parsed={"resumed": True})
 
     def _tool_disconnect(self, args: dict[str, Any]) -> dict[str, Any]:
         result = self._driver.disconnect()
