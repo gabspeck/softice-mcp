@@ -346,8 +346,45 @@ class TestParseDisasm:
         assert insns[0]["address"] == 0x401000
         assert insns[0]["mnemonic"] == "PUSH"
         assert insns[0]["operands"] == "EBP"
+        assert insns[0]["annotation"] == ""
         assert insns[1]["mnemonic"] == "MOV"
         assert insns[1]["operands"] == "EBP,ESP"
+
+    def test_trailing_jump_annotation(self):
+        """SoftICE paints `(JUMP)` / `(NO JUMP)` beside conditional branches;
+        they must land in `annotation`, not leak into `operands`."""
+        rows = [
+            "0028:C00036A6  JNZ       C00036BD                                 (NO JUMP)",
+            "0028:00401200  JZ        00401230                                 (JUMP)",
+        ]
+        parsed = parse_disasm(rows)
+        insns = parsed["parsed"]["instructions"]
+        assert insns[0]["operands"] == "C00036BD"
+        assert insns[0]["annotation"] == "(NO JUMP)"
+        assert insns[1]["operands"] == "00401230"
+        assert insns[1]["annotation"] == "(JUMP)"
+
+    def test_memory_ref_annotation(self):
+        """At current EIP, SoftICE appends the dereferenced memory value
+        (`DS:00401234=DEADBEEF`) after the operands."""
+        rows = [
+            "0028:C00034C5  MOV       EDI,[C00106A8]  DS:C00106A8=C959F068",
+        ]
+        parsed = parse_disasm(rows)
+        insn = parsed["parsed"]["instructions"][0]
+        assert insn["operands"] == "EDI,[C00106A8]"
+        assert insn["annotation"] == "DS:C00106A8=C959F068"
+
+    def test_truncated_annotation_preserved(self):
+        """Pyte's 80-col buffer can chop the closing `)` off annotations;
+        whatever's captured should still land in `annotation`, not operands."""
+        rows = [
+            "247:0070  JNZ       00A3                                         (JUMP",
+        ]
+        parsed = parse_disasm(rows)
+        insn = parsed["parsed"]["instructions"][0]
+        assert insn["operands"] == "00A3"
+        assert insn["annotation"] == "(JUMP"
 
     def test_no_bytes_column(self):
         """SoftICE's 80-col VT100 U output sometimes omits the code-bytes column
@@ -363,6 +400,7 @@ class TestParseDisasm:
         assert len(insns) == 2
         assert insns[0]["mnemonic"] == "PUSH"
         assert insns[0]["bytes"] == ""
+        assert insns[0]["annotation"] == ""
         assert insns[1]["operands"] == "EBP,ESP"
 
     def test_no_match(self):

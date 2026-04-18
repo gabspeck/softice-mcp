@@ -357,6 +357,21 @@ _DISASM_LINE = re.compile(
 )
 
 
+def _split_operands_annotation(operands: str) -> tuple[str, str]:
+    """Split operand text from SoftICE's trailing hint.
+
+    SoftICE annotates conditional jumps (``(JUMP)`` / ``(NO JUMP)``) and
+    current-EIP memory refs (``DS:00401234=DEADBEEF``) at a fixed rightmost
+    column, separated from the real operands by a run of spaces. x86 operand
+    syntax only uses single spaces (``DWORD PTR [ESP]``), so a 2+-space gap
+    reliably marks the hint boundary.
+    """
+    parts = re.split(r"\s{2,}", operands.strip(), maxsplit=1)
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0].strip(), parts[1].strip()
+
+
 def parse_disasm(command_rows: CommandRows) -> dict[str, Any]:
     out: list[dict[str, Any]] = []
     for row in command_rows:
@@ -369,13 +384,15 @@ def parse_disasm(command_rows: CommandRows) -> dict[str, Any]:
             addr = int(linear, 16)
         except ValueError:
             continue
+        operands, annotation = _split_operands_annotation(m.group("operands") or "")
         out.append(
             {
                 "address": addr,
                 "seg_offset": raw_addr,
                 "bytes": (m.group("bytes") or "").strip(),
                 "mnemonic": m.group("mnemonic").upper(),
-                "operands": (m.group("operands") or "").strip(),
+                "operands": operands,
+                "annotation": annotation,
             }
         )
     if not out:
