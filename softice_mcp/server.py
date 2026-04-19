@@ -207,6 +207,8 @@ class MCPServer:
             return self._tool_popup(arguments)
         if name == "resume":
             return self._tool_resume(arguments)
+        if name == "wait_for_popup":
+            return self._tool_wait_for_popup(arguments)
         if name == "disconnect":
             return self._tool_disconnect(arguments)
         if name == "screen":
@@ -259,6 +261,26 @@ class MCPServer:
         snap = self._driver.raw_cmd(line, timeout=1.0)
         snap["line"] = line
         return _parsed_envelope(snap, parsed={"resumed": True})
+
+    def _tool_wait_for_popup(self, args: dict[str, Any]) -> dict[str, Any]:
+        timeout_ms = self._optional_int(args, "timeout_ms", 30000)
+        poll_interval_ms = self._optional_int(args, "poll_interval_ms", 100)
+        if timeout_ms is None or timeout_ms < 0:
+            raise ValueError("timeout_ms must be >= 0")
+        if poll_interval_ms is None or poll_interval_ms < 1:
+            raise ValueError("poll_interval_ms must be >= 1")
+        snap = self._driver.wait_for_popup(
+            timeout_ms=timeout_ms,
+            poll_interval_ms=poll_interval_ms,
+        )
+        return _parsed_envelope(
+            snap,
+            parsed={
+                "detected": bool(snap.get("popped_in")) and not bool(snap.get("timed_out")),
+                "timed_out": bool(snap.get("timed_out")),
+                "elapsed_ms": int(snap.get("elapsed_ms", 0)),
+            },
+        )
 
     def _tool_disconnect(self, args: dict[str, Any]) -> dict[str, Any]:
         result = self._driver.disconnect()
@@ -667,6 +689,23 @@ class MCPServer:
                 "resume",
                 "Resume execution (G [addr]). Call this before ending your turn — leaving SoftICE popped freezes the VM.",
                 {"address": addr_schema},
+                [],
+            ),
+            self._tool(
+                "wait_for_popup",
+                "Block until SoftICE pops in or the timeout expires. Use this after `resume` when you want to wait for a breakpoint hit while the VM runs. If SoftICE is popped when it returns, call `resume` before ending your turn.",
+                {
+                    "timeout_ms": {
+                        "type": "integer",
+                        "default": 30000,
+                        "description": "Maximum time to wait before returning a timeout result.",
+                    },
+                    "poll_interval_ms": {
+                        "type": "integer",
+                        "default": 100,
+                        "description": "Polling interval for passive PTY drains while waiting.",
+                    },
+                },
                 [],
             ),
             self._tool(

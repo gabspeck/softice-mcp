@@ -27,6 +27,7 @@ class FakeScreen:
 
 class FakeSoftICE:
     instances: list["FakeSoftICE"] = []
+    render_sequence: list[list[str]] = []
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.path = kwargs.get("path") or (args[0] if args else None)
@@ -37,6 +38,7 @@ class FakeSoftICE:
         self.send_calls: list[bytes] = []
         self.drain_calls = 0
         self.fail_next_cmd: BaseException | None = None
+        self.fail_next_drain: BaseException | None = None
         self.screen = FakeScreen()
         FakeSoftICE.instances.append(self)
 
@@ -63,18 +65,24 @@ class FakeSoftICE:
 
     def drain(self, timeout: float = 0.6, settle: float = 0.2) -> bytes:
         self.drain_calls += 1
+        if self.fail_next_drain is not None:
+            exc, self.fail_next_drain = self.fail_next_drain, None
+            raise exc
         return b""
 
     def popup(self, timeout: float = 1.5) -> bytes:
         return b""
 
     def render(self) -> list[str]:
+        if FakeSoftICE.render_sequence:
+            return FakeSoftICE.render_sequence.pop(0)
         return [" " * 80 for _ in range(25)]
 
 
 @pytest.fixture
 def fake_softice(monkeypatch):
     FakeSoftICE.instances = []
+    FakeSoftICE.render_sequence = []
     monkeypatch.setattr(driver_mod, "SoftICE", FakeSoftICE)
     yield FakeSoftICE
 
@@ -194,6 +202,73 @@ class TestSnapshot:
         result = drv.raw_cmd("R", timeout=0.1)
         assert "popped_in" in result
         assert result["cursor"] == [24, 0]
+
+
+class TestWaitForPopup:
+    def test_returns_immediately_when_cached_popped(self, fake_softice):
+        drv = SoftICEDriver()
+        drv.connect("/tmp/fake-pty")
+        drv._popped_in = True
+
+        result = drv.wait_for_popup(timeout_ms=1000, poll_interval_ms=10)
+
+        assert result["popped_in"] is True
+        assert result["timed_out"] is False
+        assert result["elapsed_ms"] >= 0
+        assert fake_softice.instances[0].drain_calls == 0
+
+    def test_detects_popup_after_polling(self, fake_softice):
+        drv = SoftICEDriver()
+        drv.connect("/tmp/fake-pty")
+        blank = [" " * 80 for _ in range(25)]
+        popped = blank.copy()
+        popped[24] = ":"
+        fake_softice.render_sequence = [blank, blank, popped]
+
+        result = drv.wait_for_popup(timeout_ms=50, poll_interval_ms=1)
+
+        assert result["popped_in"] is True
+        assert result["timed_out"] is False
+        assert result["elapsed_ms"] >= 0
+
+    def test_times_out_cleanly(self, fake_softice):
+        drv = SoftICEDriver()
+        drv.connect("/tmp/fake-pty")
+
+        result = drv.wait_for_popup(timeout_ms=5, poll_interval_ms=1)
+
+        assert result["popped_in"] is False
+        assert result["timed_out"] is True
+        assert result["elapsed_ms"] == 5
+
+    def test_retries_recoverable_drain_error(self, fake_softice):
+        drv = SoftICEDriver()
+        drv.connect("/tmp/fake-pty")
+        first = fake_softice.instances[0]
+        first.fail_next_drain = OSError(errno.EIO, "io error")
+        blank = [" " * 80 for _ in range(25)]
+        popped = blank.copy()
+        popped[24] = ":"
+        fake_softice.render_sequence = [blank, popped]
+
+        result = drv.wait_for_popup(timeout_ms=50, poll_interval_ms=1)
+
+        assert result["popped_in"] is True
+        assert len(fake_softice.instances) == 2
+
+    @pytest.mark.parametrize(
+        ("timeout_ms", "poll_interval_ms", "message"),
+        [
+            (-1, 10, "timeout_ms must be >= 0"),
+            (10, 0, "poll_interval_ms must be >= 1"),
+        ],
+    )
+    def test_rejects_invalid_arguments(self, fake_softice, timeout_ms, poll_interval_ms, message):
+        drv = SoftICEDriver()
+        drv.connect("/tmp/fake-pty")
+
+        with pytest.raises(ValueError, match=message):
+            drv.wait_for_popup(timeout_ms=timeout_ms, poll_interval_ms=poll_interval_ms)
 
 
 class TestExpandedWindow:
