@@ -54,7 +54,7 @@ With the VM running and SoftICE popped out:
 
 ## Tool surface
 
-Session / raw: `popup`, `resume`, `disconnect`, `screen`, `raw_cmd`, `send_keys`.
+Session / raw: `popup`, `resume`, `wait_for_popup`, `disconnect`, `screen`, `raw_cmd`, `send_keys`.
 Flow control: `step`, `step_over`, `go_until`.
 Inspection: `registers`, `read_memory`, `disassemble`, `eval_expr`,
 `addr_context`, `module_info`.
@@ -63,6 +63,11 @@ Breakpoints: `bp_set`, `bp_list`, `bp_mutate`.
 Structured tools auto-pop SoftICE (Ctrl-D) on demand, so `popup` is only
 needed when you want to break in without issuing a command. `resume` stays
 explicit — always call it before ending your turn.
+
+`wait_for_popup` is the polling-based way to block until SoftICE pops back in,
+usually because a breakpoint hit while the VM was running. The recommended
+pattern is: `bp_set`, `resume`, `wait_for_popup`, inspect with typed tools,
+then `resume` again. It does not emit unsolicited MCP notifications.
 
 `raw_cmd` and `send_keys` are escape hatches. `raw_cmd` runs an arbitrary
 SoftICE command line; `send_keys` writes raw bytes (arrow keys, ESC, function

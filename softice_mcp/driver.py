@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -148,6 +149,45 @@ class SoftICEDriver:
     def popup(self, timeout: float = 1.5) -> dict[str, Any]:
         raw = self._retry_once("popup", timeout=timeout)
         return self._snapshot(raw)
+
+    def wait_for_popup(
+        self,
+        *,
+        timeout_ms: int = 30_000,
+        poll_interval_ms: int = 100,
+    ) -> dict[str, Any]:
+        if timeout_ms < 0:
+            raise ValueError("timeout_ms must be >= 0")
+        if poll_interval_ms < 1:
+            raise ValueError("poll_interval_ms must be >= 1")
+
+        started = time.monotonic()
+        if self._popped_in is True:
+            snap = self._snapshot(b"")
+            snap["popped_in"] = True
+            snap["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+            snap["timed_out"] = False
+            return snap
+
+        deadline = started + (timeout_ms / 1000.0)
+        last_snap = self.drain(timeout=0.0, settle=0.0)
+        if last_snap["popped_in"]:
+            last_snap["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+            last_snap["timed_out"] = False
+            return last_snap
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_snap["elapsed_ms"] = timeout_ms
+                last_snap["timed_out"] = True
+                return last_snap
+            wait_s = min(remaining, poll_interval_ms / 1000.0)
+            last_snap = self.drain(timeout=wait_s, settle=0.0)
+            if last_snap["popped_in"]:
+                last_snap["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+                last_snap["timed_out"] = False
+                return last_snap
 
     def _snapshot(self, raw: bytes) -> dict[str, Any]:
         s = self.ensure_open()
