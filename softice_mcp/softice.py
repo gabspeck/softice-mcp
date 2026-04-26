@@ -301,10 +301,19 @@ class SoftICE:
             self.send_keys(line + "\r")
             return self.drain(timeout=timeout, is_done=is_done)
 
-    def popup(self, timeout: float = 1.5) -> bytes:
-        """Ctrl-D to break into SoftICE."""
+    def popup(
+        self,
+        timeout: float = 1.5,
+        is_done: Callable[[], bool] | None = None,
+    ) -> bytes:
+        """Ctrl-D to break into SoftICE.
+
+        Ctrl-D is a toggle, so the optional ``is_done`` predicate is the
+        caller's responsibility — pass one only when the desired end state
+        is unambiguous (e.g. ``ensure_popped`` knows it wants popped_in).
+        """
         self.send_keys(b"\x04")
-        return self.drain(timeout=timeout)
+        return self.drain(timeout=timeout, is_done=is_done)
 
     def reset(self) -> None:
         """Best-effort: try to escape a help pager and get back to the prompt."""

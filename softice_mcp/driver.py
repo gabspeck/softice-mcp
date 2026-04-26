@@ -266,9 +266,25 @@ class SoftICEDriver:
             return False
         if self.drain(timeout=0.1, settle=0.05)["popped_in"]:
             return False
-        self._retry_once("popup", timeout=timeout)
+        # We confirmed detached above, so the desired end state is unambiguous:
+        # exit drain as soon as detect_popped_in() flips True. Safe because the
+        # predicate only short-circuits on a positive observation — if SoftICE
+        # doesn't actually pop, we still time out.
+        self._retry_once(
+            "popup",
+            timeout=timeout,
+            is_done=lambda: self._observed_popped_in(),
+        )
         self._popped_in = True
         return True
+
+    def _observed_popped_in(self) -> bool:
+        sice = self._sice
+        if sice is None or sice.fd is None:
+            return False
+        rows = sice.render()
+        bounds = detect_command_bounds(rows, self._bounds)
+        return detect_popped_in(rows, bounds)
 
     # ---- window management ------------------------------------------
 
