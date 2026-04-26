@@ -466,47 +466,60 @@ class MCPServer:
         )
         context = args.get("context")
         addr_line: str | None = compose_addr_switch(context) if context else None
+        return_breakpoints = bool(args.get("return_breakpoints", False))
 
         note: str | None = None
         if kind in ("bpx", "bpm") and isinstance(address, int):
             if 0x00400000 <= address <= 0x7FFFFFFF and not context:
                 note = REMINDER_ADDR
 
-        # SoftICE 3.x rejects `ADDR x; BPX y` compound with Invalid Context
-        # Handle — switch has to commit before BPX runs. Issue as two commands.
-        if addr_line is not None:
-            addr_snap = self._driver.cmd_with_extract(addr_line, timeout=2.0)
-            addr_msg = _command_output_message(addr_snap["command_rows"])
-            if addr_msg:
+        # Hoist the expanded Command window over the entire ADDR/BPX/BL flow so
+        # we pay one WC/WD restore round-trip total instead of one per inner
+        # cmd_with_extract that would otherwise set expand_window=True.
+        with self._driver.expanded_command_window():
+            # SoftICE 3.x rejects `ADDR x; BPX y` compound with Invalid Context
+            # Handle — switch has to commit before BPX runs. Issue as two commands.
+            if addr_line is not None:
+                addr_snap = self._driver.cmd_with_extract(
+                    addr_line, timeout=2.0, expand_window=False
+                )
+                addr_msg = _command_output_message(addr_snap["command_rows"])
+                if addr_msg:
+                    return _parsed_envelope(
+                        addr_snap,
+                        parsed={"issued": [addr_line]},
+                        parse_error="addr_switch_failed",
+                        note=addr_msg,
+                    )
+
+            snap = self._driver.cmd_with_extract(
+                bp_line, timeout=2.0, expand_window=False
+            )
+            # BPX/BPM/BPIO/BPINT are silent on success; non-empty output is SoftICE
+            # rejecting the command (e.g. "Invalid Address", "Syntax error").
+            bp_msg = _command_output_message(snap["command_rows"])
+            issued = [addr_line, bp_line] if addr_line else [bp_line]
+            if bp_msg:
                 return _parsed_envelope(
-                    addr_snap,
-                    parsed={"issued": [addr_line]},
-                    parse_error="addr_switch_failed",
-                    note=addr_msg,
+                    snap,
+                    parsed={"issued": issued},
+                    parse_error="bpx_rejected",
+                    note=bp_msg,
                 )
 
-        snap = self._driver.cmd_with_extract(bp_line, timeout=2.0, expand_window=False)
-        # BPX/BPM/BPIO/BPINT are silent on success; non-empty output is SoftICE
-        # rejecting the command (e.g. "Invalid Address", "Syntax error").
-        bp_msg = _command_output_message(snap["command_rows"])
-        issued = [addr_line, bp_line] if addr_line else [bp_line]
-        if bp_msg:
-            return _parsed_envelope(
-                snap,
-                parsed={"issued": issued},
-                parse_error="bpx_rejected",
-                note=bp_msg,
-            )
-
-        follow = self._driver.cmd_with_extract("BL", timeout=1.5, expand_window=True)
-        with span("parse.parse_breakpoint_list", rows=len(follow["command_rows"])):
-            parsed_bl = parse_breakpoint_list(follow["command_rows"])
-        bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
-        return _parsed_envelope(
-            snap,
-            parsed={"issued": issued, "breakpoints": bps},
-            note=note,
-        )
+            parsed: dict[str, Any] = {"issued": issued}
+            if return_breakpoints:
+                follow = self._driver.cmd_with_extract(
+                    "BL", timeout=1.5, expand_window=False
+                )
+                with span(
+                    "parse.parse_breakpoint_list",
+                    rows=len(follow["command_rows"]),
+                ):
+                    parsed_bl = parse_breakpoint_list(follow["command_rows"])
+                bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
+                parsed["breakpoints"] = bps
+        return _parsed_envelope(snap, parsed=parsed, note=note)
 
     def _tool_bp_list(self, args: dict[str, Any]) -> dict[str, Any]:
         snap = self._driver.cmd_with_extract("BL", timeout=1.5, expand_window=True)
@@ -530,16 +543,19 @@ class MCPServer:
                 raise ValueError("index must be an integer or '*'")
         else:
             index = self._require_int(args, "index")
+        return_breakpoints = bool(args.get("return_breakpoints", False))
         line = compose_bp_mutate(op, index)
         snap = self._driver.cmd_with_extract(line, timeout=1.5, expand_window=False)
-        follow = self._driver.cmd_with_extract("BL", timeout=1.5, expand_window=True)
-        with span("parse.parse_breakpoint_list", rows=len(follow["command_rows"])):
-            parsed_bl = parse_breakpoint_list(follow["command_rows"])
-        bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
-        return _parsed_envelope(
-            snap,
-            parsed={"issued": line, "breakpoints": bps},
-        )
+        parsed: dict[str, Any] = {"issued": line}
+        if return_breakpoints:
+            follow = self._driver.cmd_with_extract(
+                "BL", timeout=1.5, expand_window=True
+            )
+            with span("parse.parse_breakpoint_list", rows=len(follow["command_rows"])):
+                parsed_bl = parse_breakpoint_list(follow["command_rows"])
+            bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
+            parsed["breakpoints"] = bps
+        return _parsed_envelope(snap, parsed=parsed)
 
     # ---- transport -----------------------------------------------
 
@@ -847,6 +863,8 @@ class MCPServer:
             self._tool(
                 "bp_set",
                 "Arm a breakpoint. Composes BPX/BPM[size]/BPIO/BPINT with optional IF/DO. "
+                "By default returns only the issued command line; set "
+                "`return_breakpoints=true` to also run BL and include the parsed list. "
                 + REMINDER_ADDR
                 + " " + REMINDER_RESUME,
                 {
@@ -869,6 +887,11 @@ class MCPServer:
                         "type": "string",
                         "description": "Optional process name to prefix as `ADDR <ctx>;`. Required when the address is in 0x00400000..0x7FFFFFFF and loaded in a specific process.",
                     },
+                    "return_breakpoints": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, run BL after the BP and include `breakpoints` in the response. Default false (saves a round-trip).",
+                    },
                 },
                 ["kind"],
             ),
@@ -880,10 +903,17 @@ class MCPServer:
             ),
             self._tool(
                 "bp_mutate",
-                "Clear (BC), enable (BE), or disable (BD) a breakpoint by index, or pass '*' for all.",
+                "Clear (BC), enable (BE), or disable (BD) a breakpoint by index, or pass '*' for all. "
+                "By default returns only the issued command line; set "
+                "`return_breakpoints=true` to also run BL and include the parsed list.",
                 {
                     "op": {"type": "string", "enum": ["clear", "enable", "disable"]},
                     "index": {"oneOf": [{"type": "integer"}, {"type": "string", "enum": ["*"]}]},
+                    "return_breakpoints": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, run BL after the mutation and include `breakpoints` in the response. Default false (saves a round-trip).",
+                    },
                 },
                 ["op", "index"],
             ),

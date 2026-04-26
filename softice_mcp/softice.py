@@ -37,6 +37,7 @@ import os
 import select
 import sys
 import time
+from collections.abc import Callable
 
 import pyte
 
@@ -183,9 +184,20 @@ class SoftICE:
     def __exit__(self, *exc):
         self.close()
 
-    def drain(self, timeout: float = 1.5, settle: float = 0.35) -> bytes:
+    def drain(
+        self,
+        timeout: float = 1.5,
+        settle: float = 0.35,
+        is_done: Callable[[], bool] | None = None,
+    ) -> bytes:
         """Read until no new bytes arrive for `settle` seconds,
-        or `timeout` elapses with no data at all."""
+        or `timeout` elapses with no data at all.
+
+        When ``is_done`` is supplied, it's invoked after each chunk has been
+        fed into the pyte stream (i.e. only when fresh bytes actually arrived
+        — the no-data path stays cheap). Returning ``True`` exits the loop
+        immediately with whatever has been read so far.
+        """
         assert self.fd_in is not None
         with span("drain.io") as s:
             data = bytearray()
@@ -204,8 +216,12 @@ class SoftICE:
                     if chunk:
                         data.extend(chunk)
                         end = time.monotonic() + settle
-            if data:
-                self.stream.feed(data.decode("latin-1"))
+                        # Feed incrementally so the rendered grid reflects the
+                        # latest bytes when ``is_done`` runs. pyte handles
+                        # partial feeds correctly.
+                        self.stream.feed(chunk.decode("latin-1"))
+                        if is_done is not None and is_done():
+                            break
             s.add(bytes=len(data))
             return bytes(data)
 
@@ -260,19 +276,30 @@ class SoftICE:
             s = s.encode("latin-1")
         self._send_paced(s)
 
-    def cmd(self, line: str, timeout: float = 1.5) -> bytes:
+    def cmd(
+        self,
+        line: str,
+        timeout: float = 1.5,
+        is_done: Callable[[], bool] | None = None,
+    ) -> bytes:
         """Send a SoftICE command + CR, wait for paint, return raw bytes.
 
         Sends a bare CR first to reset any half-typed line state (SoftICE
         will answer an empty line with a no-op new prompt). Does NOT prepend
         Esc — Esc + letter acts as a meta shortcut in SoftICE serial mode
         and swallows the first character of the next command.
+
+        When ``is_done`` is supplied it's plumbed into the final drain so
+        the call can short-circuit as soon as a fresh prompt is detected.
+        The primer drain uses the same predicate — its only job is to absorb
+        the bare-CR's prompt redraw, which is exactly what ``is_done``
+        detects.
         """
         with span("softice.cmd", line=line):
             self.send_keys(b"\r")
-            self.drain(0.3, 0.15)
+            self.drain(0.3, 0.05, is_done=is_done)
             self.send_keys(line + "\r")
-            return self.drain(timeout=timeout)
+            return self.drain(timeout=timeout, is_done=is_done)
 
     def popup(self, timeout: float = 1.5) -> bytes:
         """Ctrl-D to break into SoftICE."""
