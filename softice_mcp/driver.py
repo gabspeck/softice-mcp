@@ -1,7 +1,7 @@
 """Runtime wrapper around the SoftICE serial driver.
 
-Owns the single pyte-backed PTY connection, handles one-shot reconnect on
-bad-fd errors, exposes a ``cmd_with_extract`` primitive that slices command
+Owns the single pyte-backed transport connection, handles one-shot reconnect
+on bad-fd errors, exposes a ``cmd_with_extract`` primitive that slices command
 output out of the 80x25 grid, and provides a context manager that hides the
 Code/Data panes so long output can land in a 21-row Command window without
 triggering SoftICE's ``Press any key...`` pager.
@@ -32,7 +32,7 @@ MAX_PAGER_STEPS = 32
 
 
 class SoftICEIOError(RuntimeError):
-    """PTY read/write failed, including after one automatic reconnect."""
+    """Transport read/write failed, including after one automatic reconnect."""
 
 
 class SoftICEStateError(RuntimeError):
@@ -57,7 +57,7 @@ class SoftICEDriver:
     # ---- lifecycle ---------------------------------------------------
 
     def connect(self, path: str) -> dict[str, Any]:
-        """Open a fresh PTY connection. Replaces any existing one.
+        """Open a fresh transport connection. Replaces any existing one.
 
         Eagerly opens so permission/ENOENT errors surface at connect-time
         rather than being deferred to the first command.
@@ -81,8 +81,9 @@ class SoftICEDriver:
             return self._sice
         if self._path is None:
             raise SoftICEStateError(
-                "Not connected. Call `connect(path=...)` with the socat PTY "
-                "path (e.g. /tmp/softice_host) before issuing commands."
+                "Not connected. Call `connect(path=...)` with the 86Box "
+                "Named Pipe / UNIX FIFO base path (e.g. /tmp/softice) "
+                "before issuing commands."
             )
         sice = SoftICE(path=self._path)
         sice.open()
@@ -101,7 +102,7 @@ class SoftICEDriver:
 
     def _retry_once(self, method: str, *args: Any, **kwargs: Any) -> Any:
         """Call ``self._sice.<method>(*args, **kwargs)``; on a recoverable
-        PTY error, close/reopen and resolve the method fresh against the
+        transport error, close/reopen and resolve the method fresh against the
         new instance before retrying once.
         """
         sice = self.ensure_open()
@@ -118,7 +119,9 @@ class SoftICEDriver:
             sice = self.ensure_open()
             return getattr(sice, method)(*args, **kwargs)
         except (OSError, ValueError) as exc2:
-            raise SoftICEIOError(f"PTY I/O failed after reconnect: {exc2}") from exc2
+            raise SoftICEIOError(
+                f"SoftICE transport I/O failed after reconnect: {exc2}"
+            ) from exc2
 
     @property
     def bounds(self) -> tuple[int, int]:

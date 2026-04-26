@@ -1,4 +1,4 @@
-"""Driver reconnect behaviour without touching a real PTY.
+"""Driver reconnect behaviour without touching a real transport.
 
 We inject a fake SoftICE class that records open/close counts and can be
 primed to fail on the next call. The driver's ``_retry_once`` should close
@@ -105,10 +105,10 @@ class TestConnect:
 
     def test_connect_opens_eagerly_with_path(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/custom-pty")
+        drv.connect("/tmp/softice")
         assert len(fake_softice.instances) == 1
         assert fake_softice.instances[0].opens == 1
-        assert fake_softice.instances[0].path == "/tmp/custom-pty"
+        assert fake_softice.instances[0].path == "/tmp/softice"
 
     def test_connect_rejects_empty_path(self, fake_softice):
         drv = SoftICEDriver()
@@ -125,7 +125,7 @@ class TestConnect:
 
     def test_disconnect_then_ensure_open_raises(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         drv.disconnect()
         with pytest.raises(SoftICEStateError, match="Not connected"):
             drv.ensure_open()
@@ -134,13 +134,13 @@ class TestConnect:
 class TestReconnect:
     def test_ensure_open_reuses(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         drv.ensure_open()
         assert len(fake_softice.instances) == 1
 
     def test_retry_on_ebadf(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         first = fake_softice.instances[0]
         first.fail_next_cmd = OSError(errno.EBADF, "bad fd")
         result = drv.raw_cmd("R", timeout=0.1)
@@ -152,21 +152,21 @@ class TestReconnect:
 
     def test_retry_on_eio(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         fake_softice.instances[0].fail_next_cmd = OSError(errno.EIO, "io error")
         drv.raw_cmd("R", timeout=0.1)
         assert len(fake_softice.instances) == 2
 
     def test_retry_on_closed_fd_value_error(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         fake_softice.instances[0].fail_next_cmd = ValueError("I/O on closed file")
         drv.raw_cmd("R", timeout=0.1)
         assert len(fake_softice.instances) == 2
 
     def test_non_recoverable_propagates(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         fake_softice.instances[0].fail_next_cmd = OSError(errno.EPERM, "denied")
         with pytest.raises(OSError):
             drv.raw_cmd("R", timeout=0.1)
@@ -174,7 +174,7 @@ class TestReconnect:
 
     def test_second_failure_becomes_io_error(self, fake_softice, monkeypatch):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         original_cmd = FakeSoftICE.cmd
 
         def always_fail(self, line, timeout=1.5):
@@ -187,7 +187,7 @@ class TestReconnect:
 
     def test_disconnect(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         result = drv.disconnect()
         assert result["was_open"] is True
         assert fake_softice.instances[0].closes == 1
@@ -198,7 +198,7 @@ class TestReconnect:
 class TestSnapshot:
     def test_popped_in_flag(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         result = drv.raw_cmd("R", timeout=0.1)
         assert "popped_in" in result
         assert result["cursor"] == [24, 0]
@@ -207,7 +207,7 @@ class TestSnapshot:
 class TestWaitForPopup:
     def test_returns_immediately_when_cached_popped(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         drv._popped_in = True
 
         result = drv.wait_for_popup(timeout_ms=1000, poll_interval_ms=10)
@@ -219,7 +219,7 @@ class TestWaitForPopup:
 
     def test_detects_popup_after_polling(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         blank = [" " * 80 for _ in range(25)]
         popped = blank.copy()
         popped[24] = ":"
@@ -233,7 +233,7 @@ class TestWaitForPopup:
 
     def test_times_out_cleanly(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
 
         result = drv.wait_for_popup(timeout_ms=5, poll_interval_ms=1)
 
@@ -243,7 +243,7 @@ class TestWaitForPopup:
 
     def test_retries_recoverable_drain_error(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         first = fake_softice.instances[0]
         first.fail_next_drain = OSError(errno.EIO, "io error")
         blank = [" " * 80 for _ in range(25)]
@@ -265,7 +265,7 @@ class TestWaitForPopup:
     )
     def test_rejects_invalid_arguments(self, fake_softice, timeout_ms, poll_interval_ms, message):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
 
         with pytest.raises(ValueError, match=message):
             drv.wait_for_popup(timeout_ms=timeout_ms, poll_interval_ms=poll_interval_ms)
@@ -274,7 +274,7 @@ class TestWaitForPopup:
 class TestExpandedWindow:
     def test_context_manager_restores_bounds(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         assert drv.bounds == (17, 24)
         with drv.expanded_command_window():
             assert drv.bounds == (4, 24)
@@ -282,7 +282,7 @@ class TestExpandedWindow:
 
     def test_context_manager_issues_wc_wd(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         with drv.expanded_command_window():
             pass
         calls = fake_softice.instances[0].cmd_calls
@@ -294,7 +294,7 @@ class TestExpandedWindow:
 
     def test_restores_on_exception(self, fake_softice):
         drv = SoftICEDriver()
-        drv.connect("/tmp/fake-pty")
+        drv.connect("/tmp/softice")
         with pytest.raises(RuntimeError):
             with drv.expanded_command_window():
                 assert drv.bounds == (4, 24)

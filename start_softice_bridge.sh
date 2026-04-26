@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Legacy helper for the old socat-based PTY bridge.
+# Preferred setup now uses 86Box's Named Pipe / UNIX FIFO backend directly.
 set -euo pipefail
 
 guest_link="${1:-/tmp/softice_guest}"

@@ -670,11 +670,11 @@ class MCPServer:
         return [
             self._tool(
                 "connect",
-                "Open a SoftICE serial PTY. Call this once before any other tool — subsequent commands reuse the connection and auto-pop SoftICE (Ctrl-D) when needed. `path` is the host-side PTY symlink created by `tools/start_softice_bridge.sh` (typically `/tmp/softice_host`). Calling `connect` again replaces the existing connection.",
+                "Open the SoftICE serial transport. Call this once before any other tool — subsequent commands reuse the connection and auto-pop SoftICE (Ctrl-D) when needed. Use the 86Box Named Pipe / UNIX FIFO base path (typically `/tmp/softice`, which maps to `/tmp/softice.in` and `/tmp/softice.out`). Passing either endpoint file also works; the server normalizes it back to the same base path. The transport is locked to one MCP process at a time. Calling `connect` again replaces the existing connection.",
                 {
                     "path": {
                         "type": "string",
-                        "description": "Filesystem path to the PTY symlink, e.g. /tmp/softice_host.",
+                        "description": "Filesystem path to the 86Box FIFO base (e.g. /tmp/softice) or one endpoint file such as /tmp/softice.in.",
                     }
                 },
                 ["path"],
@@ -703,14 +703,14 @@ class MCPServer:
                     "poll_interval_ms": {
                         "type": "integer",
                         "default": 100,
-                        "description": "Polling interval for passive PTY drains while waiting.",
+                        "description": "Polling interval for passive transport drains while waiting.",
                     },
                 },
                 [],
             ),
             self._tool(
                 "disconnect",
-                "Close the PTY and forget the path. A fresh `connect` is required before further commands.",
+                "Close the transport and forget the path. A fresh `connect` is required before further commands.",
                 {},
                 [],
             ),
@@ -736,7 +736,7 @@ class MCPServer:
             ),
             self._tool(
                 "send_keys",
-                "Escape hatch: write raw bytes to the PTY (no CR appended). Escapes supported: \\r \\n \\t \\e \\x04. Use only for byte-level input no other tool can produce — arrow-key navigation (BH list), ESC to dismiss pagers, function keys, chained Ctrl-sequences. For command lines use `raw_cmd`; for structured debugger ops use the typed tools. State in one sentence why no typed tool fits before issuing.",
+                "Escape hatch: write raw bytes to the transport (no CR appended). Escapes supported: \\r \\n \\t \\e \\x04. Use only for byte-level input no other tool can produce — arrow-key navigation (BH list), ESC to dismiss pagers, function keys, chained Ctrl-sequences. For command lines use `raw_cmd`; for structured debugger ops use the typed tools. State in one sentence why no typed tool fits before issuing.",
                 {
                     "keys": {"type": "string"},
                     "drain_timeout": {"type": "number"},
@@ -853,9 +853,9 @@ class MCPServer:
 def _run_self_test(path: str) -> int:
     """Smoke-test driver + parsers against a live SoftICE session.
 
-    Requires the socat bridge and a VM where SoftICE is configured for
-    VT100-over-serial. Prints a short summary and exits 0 on success,
-    non-zero on the first failure.
+    Requires a VM where SoftICE is configured for VT100-over-serial and 86Box
+    exposes a Named Pipe / UNIX FIFO base path. Prints a short summary and
+    exits 0 on success, non-zero on the first failure.
     """
     driver = SoftICEDriver()
     steps: list[tuple[str, dict[str, Any]]] = []
@@ -886,9 +886,9 @@ def main() -> int:
         "--self-test",
         metavar="PATH",
         default=None,
-        help="Run a live smoke test against the given PTY path and exit "
-        "(e.g. /tmp/softice_host). In normal serve mode the PTY path is "
-        "supplied by the MCP client via the `connect` tool.",
+        help="Run a live smoke test against the given transport path and exit "
+        "(typically /tmp/softice). In normal serve mode the path is supplied "
+        "by the MCP client via the `connect` tool.",
     )
     ns = parser.parse_args()
     if ns.self_test:

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Drive SoftICE 3.2 running in VT100-over-serial mode through the socat PTY
-bridge at /tmp/softice_host.
+Drive SoftICE 3.2 running in VT100-over-serial mode over 86Box Named Pipe /
+UNIX FIFO character devices.
 
-Layout: inside the Win95 VM SoftICE is configured with
+Preferred layout: inside the Win95 VM SoftICE is configured with
     SERIAL ON 1 115200    ; plus DISPLAY VT100
-and 86Box's COM1 passthrough is wired to /tmp/softice_guest, which socat
-mirrors to /tmp/softice_host on the host.
+and 86Box's COM1 backend is set to Named Pipe / UNIX FIFO in Server mode with
+path /tmp/softice. That yields:
+    /tmp/softice.in       host -> guest writes
+    /tmp/softice.out      guest -> host reads
 
 This module speaks the raw VT100 stream SoftICE emits, feeds it into a
 pyte-backed 80x25 virtual screen, and exposes:
@@ -30,6 +32,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import select
 import sys
@@ -37,26 +40,139 @@ import time
 
 import pyte
 
-HOST_PTY = "/tmp/softice_host"
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
+HOST_PATH = "/tmp/softice"
+WRITE_TIMEOUT = 1.0
+INTER_BYTE_DELAY = 0.01
+PIPE_OPEN_TIMEOUT = 3.0
+PIPE_OPEN_RETRY_DELAY = 0.05
+
+
+class SoftICEBusyError(RuntimeError):
+    """Another process already owns the SoftICE FIFO transport."""
+
+
+def _char_pipe_base(path: str) -> str:
+    if path.endswith(".in"):
+        return path[:-3]
+    if path.endswith(".out"):
+        return path[:-4]
+    return path
 
 
 class SoftICE:
-    def __init__(self, path: str = HOST_PTY, rows: int = 25, cols: int = 80):
+    def __init__(self, path: str = HOST_PATH, rows: int = 25, cols: int = 80):
         self.path = path
-        self.fd: int | None = None
+        self.fd_in: int | None = None
+        self.fd_out: int | None = None
+        self._lock_fd: int | None = None
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
 
+    @property
+    def fd(self) -> int | None:
+        return self.fd_out
+
+    @fd.setter
+    def fd(self, value: int | None) -> None:
+        self.fd_in = value
+        self.fd_out = value
+
+    def _lock_target(self) -> str:
+        return _char_pipe_base(self.path)
+
+    def _acquire_lock(self) -> None:
+        if self._lock_fd is not None or fcntl is None:
+            return
+        lock_path = f"{self._lock_target()}.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise SoftICEBusyError(
+                    f"SoftICE transport is already in use: {self._lock_target()}"
+                ) from exc
+            raise
+        self._lock_fd = fd
+
+    def _release_lock(self) -> None:
+        if self._lock_fd is None:
+            return
+        if fcntl is not None:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+        os.close(self._lock_fd)
+        self._lock_fd = None
+
+    def _open_fifo_read(self, path: str, deadline: float) -> int:
+        while True:
+            try:
+                return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as exc:
+                if exc.errno not in (errno.ENOENT,):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise FileNotFoundError(
+                        f"SoftICE read endpoint not available: {path}"
+                    ) from exc
+                time.sleep(PIPE_OPEN_RETRY_DELAY)
+
+    def _open_fifo_write(self, path: str, deadline: float) -> int:
+        while True:
+            try:
+                return os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as exc:
+                if exc.errno not in (
+                    errno.ENOENT,
+                    errno.ENXIO,
+                    errno.EAGAIN,
+                    errno.EWOULDBLOCK,
+                ):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"SoftICE write endpoint did not become ready: {path}"
+                    ) from exc
+                time.sleep(PIPE_OPEN_RETRY_DELAY)
+
+    def _open_char_pipe(self) -> None:
+        base = _char_pipe_base(self.path)
+        deadline = time.monotonic() + PIPE_OPEN_TIMEOUT
+        self.fd_in = self._open_fifo_read(f"{base}.out", deadline)
+        try:
+            self.fd_out = self._open_fifo_write(f"{base}.in", deadline)
+        except Exception:
+            assert self.fd_in is not None
+            os.close(self.fd_in)
+            self.fd_in = None
+            raise
+
     def open(self) -> None:
-        if self.fd is None:
-            self.fd = os.open(
-                self.path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK
-            )
+        if self.fd_in is not None and self.fd_out is not None:
+            return
+        self._acquire_lock()
+        try:
+            self._open_char_pipe()
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+        fds: list[int] = []
+        if self.fd_in is not None:
+            fds.append(self.fd_in)
+        if self.fd_out is not None and self.fd_out != self.fd_in:
+            fds.append(self.fd_out)
+        for fd in fds:
+            os.close(fd)
+        self.fd_in = None
+        self.fd_out = None
+        self._release_lock()
 
     def __enter__(self):
         self.open()
@@ -68,16 +184,20 @@ class SoftICE:
     def drain(self, timeout: float = 1.5, settle: float = 0.35) -> bytes:
         """Read until no new bytes arrive for `settle` seconds,
         or `timeout` elapses with no data at all."""
-        assert self.fd is not None
+        assert self.fd_in is not None
         data = bytearray()
         end = time.monotonic() + timeout
         while time.monotonic() < end:
-            r, _, _ = select.select([self.fd], [], [], 0.1)
+            r, _, _ = select.select([self.fd_in], [], [], 0.1)
             if r:
                 try:
-                    chunk = os.read(self.fd, 65536)
+                    chunk = os.read(self.fd_in, 65536)
                 except BlockingIOError:
                     continue
+                except OSError as exc:
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        continue
+                    raise
                 if chunk:
                     data.extend(chunk)
                     end = time.monotonic() + settle
@@ -85,12 +205,55 @@ class SoftICE:
             self.stream.feed(data.decode("latin-1"))
         return bytes(data)
 
+    def _write_all(self, data: bytes, timeout: float = WRITE_TIMEOUT) -> None:
+        """Write the full buffer to the nonblocking transport or raise on timeout."""
+        assert self.fd_out is not None
+        if not data:
+            return
+
+        deadline = time.monotonic() + timeout
+        view = memoryview(data)
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "SoftICE transport did not become writable before the write timeout expired"
+                )
+            try:
+                _, writable, _ = select.select([], [self.fd_out], [], remaining)
+            except InterruptedError:
+                continue
+            if not writable:
+                raise TimeoutError(
+                    "SoftICE transport did not become writable before the write timeout expired"
+                )
+            try:
+                written = os.write(self.fd_out, view)
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                raise
+            if written == 0:
+                continue
+            view = view[written:]
+
+    def _send_paced(self, data: bytes) -> None:
+        # 86Box now drains host bytes before checking guest RX capacity, so a
+        # bursty host write can drop characters inside the guest UART path.
+        # We intentionally trade throughput for deterministic delivery here.
+        for i, byte in enumerate(data):
+            self._write_all(bytes((byte,)))
+            if i + 1 < len(data):
+                time.sleep(INTER_BYTE_DELAY)
+
     def send_keys(self, s: str | bytes) -> None:
         """Write raw bytes, no terminator added."""
-        assert self.fd is not None
+        assert self.fd_out is not None
         if isinstance(s, str):
             s = s.encode("latin-1")
-        os.write(self.fd, s)
+        self._send_paced(s)
 
     def cmd(self, line: str, timeout: float = 1.5) -> bytes:
         """Send a SoftICE command + CR, wait for paint, return raw bytes.

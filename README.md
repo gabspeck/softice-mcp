@@ -1,8 +1,9 @@
 # softice-mcp
 
 An MCP server that drives SoftICE 3.x (running inside a Win95 86Box VM) over
-a VT100 serial PTY bridge, filters the debugger's multi-pane chrome out of
-command output, and exposes a set of structured tools to the Claude Code LLM.
+86Box's `Named Pipe / UNIX FIFO` serial backend, filters the debugger's
+multi-pane chrome out of command output, and exposes a set of structured tools
+to the Claude Code LLM.
 
 ## Prerequisites
 
@@ -11,12 +12,14 @@ command output, and exposes a set of structured tools to the Claude Code LLM.
    SERIAL ON 1 115200
    DISPLAY VT100
    ```
-2. 86Box COM1 passthrough wired to a host-side PTY via the bridge script:
+2. 86Box COM1 configured as `Named Pipe / UNIX FIFO` in `Server` mode with
+   path `/tmp/softice`.
+   This yields:
    ```
-   ./start_softice_bridge.sh
+   /tmp/softice.in
+   /tmp/softice.out
    ```
-   This creates `/tmp/softice_guest` (used by 86Box) and `/tmp/softice_host`
-   (used by this MCP).
+   `softice-mcp` reads from `.out` and writes to `.in`.
 
 ## Install
 
@@ -40,16 +43,25 @@ Under the relevant project's `mcpServers`:
 ```
 
 The server is connection-less at startup. The MCP client must call the
-`connect` tool with the PTY path (typically `/tmp/softice_host`) before any
-other tool. `disconnect` closes the PTY and clears the path — a fresh
-`connect` is required to resume.
+`connect` tool with the FIFO transport path before any other tool. Use the
+86Box FIFO base path:
+```
+/tmp/softice
+```
+which maps to `/tmp/softice.in` and `/tmp/softice.out`. Passing either
+endpoint file also works; `softice-mcp` normalizes both back to the same base
+path.
+
+`disconnect` closes the transport and clears the path — a fresh `connect` is
+required to resume. Only one `softice-mcp` process may own a transport path at
+a time.
 
 ## Smoke test
 
 With the VM running and SoftICE popped out:
 
 ```
-./.venv/bin/python3 mcp_server.py --self-test /tmp/softice_host
+./.venv/bin/python3 mcp_server.py --self-test /tmp/softice
 ```
 
 ## Tool surface
