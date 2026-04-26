@@ -258,12 +258,11 @@ class SoftICEDriver:
         """Pop SoftICE if currently detached. Returns True if Ctrl-D was sent.
 
         Ctrl-D is a toggle (si30ug.pdf), so a blind send while popped would
-        resume. Trust a cached True to skip the probe; otherwise drain (which
-        also refreshes the popped_in cache via _snapshot) and only send Ctrl-D
-        when genuinely detached.
+        resume. Always probe via a short drain — the cached ``_popped_in``
+        is set during transitional renders (e.g. right after ``G``) and
+        cannot be trusted as a control-flow input. Only send Ctrl-D when
+        the probe says we're genuinely detached.
         """
-        if self._popped_in is True:
-            return False
         if self.drain(timeout=0.1, settle=0.05)["popped_in"]:
             return False
         # We confirmed detached above, so the desired end state is unambiguous:
@@ -275,7 +274,6 @@ class SoftICEDriver:
             timeout=timeout,
             is_done=lambda: self._observed_popped_in(),
         )
-        self._popped_in = True
         return True
 
     def _observed_popped_in(self) -> bool:
@@ -395,9 +393,6 @@ class SoftICEDriver:
             popped_in = detect_popped_in(
                 final_rows, detect_command_bounds(final_rows, self._bounds)
             )
-            # Sync the cache so the next tool call doesn't re-probe via
-            # ensure_popped's drain when we already know the state.
-            self._popped_in = popped_in
             return {
                 "line": line,
                 "raw": bytes(raw),
