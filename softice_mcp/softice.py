@@ -40,6 +40,8 @@ import time
 
 import pyte
 
+from .profiling import span
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
@@ -185,25 +187,27 @@ class SoftICE:
         """Read until no new bytes arrive for `settle` seconds,
         or `timeout` elapses with no data at all."""
         assert self.fd_in is not None
-        data = bytearray()
-        end = time.monotonic() + timeout
-        while time.monotonic() < end:
-            r, _, _ = select.select([self.fd_in], [], [], 0.1)
-            if r:
-                try:
-                    chunk = os.read(self.fd_in, 65536)
-                except BlockingIOError:
-                    continue
-                except OSError as exc:
-                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+        with span("drain.io") as s:
+            data = bytearray()
+            end = time.monotonic() + timeout
+            while time.monotonic() < end:
+                r, _, _ = select.select([self.fd_in], [], [], 0.1)
+                if r:
+                    try:
+                        chunk = os.read(self.fd_in, 65536)
+                    except BlockingIOError:
                         continue
-                    raise
-                if chunk:
-                    data.extend(chunk)
-                    end = time.monotonic() + settle
-        if data:
-            self.stream.feed(data.decode("latin-1"))
-        return bytes(data)
+                    except OSError as exc:
+                        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                            continue
+                        raise
+                    if chunk:
+                        data.extend(chunk)
+                        end = time.monotonic() + settle
+            if data:
+                self.stream.feed(data.decode("latin-1"))
+            s.add(bytes=len(data))
+            return bytes(data)
 
     def _write_all(self, data: bytes, timeout: float = WRITE_TIMEOUT) -> None:
         """Write the full buffer to the nonblocking transport or raise on timeout."""
@@ -243,10 +247,11 @@ class SoftICE:
         # 86Box now drains host bytes before checking guest RX capacity, so a
         # bursty host write can drop characters inside the guest UART path.
         # We intentionally trade throughput for deterministic delivery here.
-        for i, byte in enumerate(data):
-            self._write_all(bytes((byte,)))
-            if i + 1 < len(data):
-                time.sleep(INTER_BYTE_DELAY)
+        with span("send_paced", n=len(data)):
+            for i, byte in enumerate(data):
+                self._write_all(bytes((byte,)))
+                if i + 1 < len(data):
+                    time.sleep(INTER_BYTE_DELAY)
 
     def send_keys(self, s: str | bytes) -> None:
         """Write raw bytes, no terminator added."""
@@ -263,10 +268,11 @@ class SoftICE:
         Esc — Esc + letter acts as a meta shortcut in SoftICE serial mode
         and swallows the first character of the next command.
         """
-        self.send_keys(b"\r")
-        self.drain(0.3, 0.15)
-        self.send_keys(line + "\r")
-        return self.drain(timeout=timeout)
+        with span("softice.cmd", line=line):
+            self.send_keys(b"\r")
+            self.drain(0.3, 0.15)
+            self.send_keys(line + "\r")
+            return self.drain(timeout=timeout)
 
     def popup(self, timeout: float = 1.5) -> bytes:
         """Ctrl-D to break into SoftICE."""
@@ -283,7 +289,8 @@ class SoftICE:
         self.drain(0.3, 0.15)
 
     def render(self) -> list[str]:
-        return [line.rstrip() for line in self.screen.display]
+        with span("pyte.render"):
+            return [line.rstrip() for line in self.screen.display]
 
     def render_bold(self) -> list[bool]:
         """Per-row flag: True when any cell on that row is rendered bold.
@@ -291,12 +298,13 @@ class SoftICE:
         SoftICE 4.2 bolds the active row in the ADDR table (and only that
         row, within the table) — the parser uses this to flag `active`.
         """
-        buf = self.screen.buffer
-        cols = self.screen.columns
-        return [
-            any(buf[y][x].bold for x in range(cols))
-            for y in range(self.screen.lines)
-        ]
+        with span("pyte.render"):
+            buf = self.screen.buffer
+            cols = self.screen.columns
+            return [
+                any(buf[y][x].bold for x in range(cols))
+                for y in range(self.screen.lines)
+            ]
 
 
 def _format_screen(rows: list[str]) -> str:

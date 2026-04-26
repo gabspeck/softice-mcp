@@ -21,6 +21,7 @@ from .parsers import (
     extract_command_output,
     has_more_pager,
 )
+from .profiling import span
 from .softice import SoftICE
 
 DEFAULT_COMMAND_BOUNDS: tuple[int, int] = (17, 24)
@@ -105,23 +106,24 @@ class SoftICEDriver:
         transport error, close/reopen and resolve the method fresh against the
         new instance before retrying once.
         """
-        sice = self.ensure_open()
-        try:
-            return getattr(sice, method)(*args, **kwargs)
-        except (OSError, ValueError) as exc:
-            if not _is_recoverable(exc):
-                raise
-        # reconnect once
-        with contextlib.suppress(Exception):
-            sice.close()
-        self._sice = None
-        try:
+        with span(f"transport.{method}"):
             sice = self.ensure_open()
-            return getattr(sice, method)(*args, **kwargs)
-        except (OSError, ValueError) as exc2:
-            raise SoftICEIOError(
-                f"SoftICE transport I/O failed after reconnect: {exc2}"
-            ) from exc2
+            try:
+                return getattr(sice, method)(*args, **kwargs)
+            except (OSError, ValueError) as exc:
+                if not _is_recoverable(exc):
+                    raise
+            # reconnect once
+            with contextlib.suppress(Exception):
+                sice.close()
+            self._sice = None
+            try:
+                sice = self.ensure_open()
+                return getattr(sice, method)(*args, **kwargs)
+            except (OSError, ValueError) as exc2:
+                raise SoftICEIOError(
+                    f"SoftICE transport I/O failed after reconnect: {exc2}"
+                ) from exc2
 
     @property
     def bounds(self) -> tuple[int, int]:
@@ -193,18 +195,19 @@ class SoftICEDriver:
                 return last_snap
 
     def _snapshot(self, raw: bytes) -> dict[str, Any]:
-        s = self.ensure_open()
-        rows = s.render()
-        bounds = detect_command_bounds(rows, self._bounds)
-        popped_in = detect_popped_in(rows, bounds)
-        self._popped_in = popped_in
-        return {
-            "raw": raw,
-            "raw_rows": rows,
-            "cursor": [s.screen.cursor.y, s.screen.cursor.x],
-            "bounds": list(bounds),
-            "popped_in": popped_in,
-        }
+        with span("snapshot"):
+            s = self.ensure_open()
+            rows = s.render()
+            bounds = detect_command_bounds(rows, self._bounds)
+            popped_in = detect_popped_in(rows, bounds)
+            self._popped_in = popped_in
+            return {
+                "raw": raw,
+                "raw_rows": rows,
+                "cursor": [s.screen.cursor.y, s.screen.cursor.x],
+                "bounds": list(bounds),
+                "popped_in": popped_in,
+            }
 
     def ensure_popped(self, timeout: float = 1.5) -> bool:
         """Pop SoftICE if currently detached. Returns True if Ctrl-D was sent.
@@ -266,51 +269,61 @@ class SoftICEDriver:
         expand_window: bool = False,
     ) -> dict[str, Any]:
         """Send a command, extract its output, auto-page through ``More?``."""
-        self.ensure_popped()
-        pre_rows = self.ensure_open().render()
-        with self._window_context(expand_window):
-            raw = bytearray()
-            raw.extend(self._retry_once("cmd", line, timeout=timeout))
-            command_rows: list[str] = []
-            command_rows_bold: list[bool] = []
-            parse_error: str | None = None
-            steps = 0
-            bounds = self._bounds
-            while True:
+        with span("cmd_with_extract", line=line, expand=expand_window):
+            with span("ensure_popped"):
+                self.ensure_popped()
+            with span("render.pre"):
+                pre_rows = self.ensure_open().render()
+            with self._window_context(expand_window):
+                raw = bytearray()
+                raw.extend(self._retry_once("cmd", line, timeout=timeout))
+                command_rows: list[str] = []
+                command_rows_bold: list[bool] = []
+                parse_error: str | None = None
+                steps = 0
+                bounds = self._bounds
+                while True:
+                    with span("page_iter", step=steps) as ps:
+                        s = self.ensure_open()
+                        with span("render.loop"):
+                            rows = s.render()
+                            bold = s.render_bold()
+                        with span("detect.bounds"):
+                            bounds = detect_command_bounds(rows, self._bounds)
+                        with span("extract"):
+                            page_rows, parse_error, page_idx = extract_command_output(
+                                rows, line if steps == 0 else "", bounds, s.screen.cursor.y
+                            )
+                        ps.add(rows=len(page_rows))
+                        command_rows.extend(page_rows)
+                        command_rows_bold.extend(bold[i] for i in page_idx)
+                        with span("has_more"):
+                            more = has_more_pager(rows, bounds)
+                        if not more or steps >= MAX_PAGER_STEPS:
+                            break
+                        raw.extend(self._retry_once("send_keys", b" ") or b"")
+                        raw.extend(self._retry_once("drain", 1.0, 0.2))
+                        steps += 1
                 s = self.ensure_open()
-                rows = s.render()
-                bold = s.render_bold()
-                bounds = detect_command_bounds(rows, self._bounds)
-                page_rows, parse_error, page_idx = extract_command_output(
-                    rows, line if steps == 0 else "", bounds, s.screen.cursor.y
-                )
-                command_rows.extend(page_rows)
-                command_rows_bold.extend(bold[i] for i in page_idx)
-                if not has_more_pager(rows, bounds) or steps >= MAX_PAGER_STEPS:
-                    break
-                raw.extend(self._retry_once("send_keys", b" ") or b"")
-                raw.extend(self._retry_once("drain", 1.0, 0.2))
-                steps += 1
-            s = self.ensure_open()
-            raw_rows = s.render()
-            cursor = [s.screen.cursor.y, s.screen.cursor.x]
-        # outside the window context: raw_rows captured inside; snapshot again
-        # for popped_in under restored bounds
-        final_rows = self.ensure_open().render()
-        return {
-            "line": line,
-            "raw": bytes(raw),
-            "raw_rows": raw_rows,
-            "pre_rows": pre_rows,
-            "final_rows": final_rows,
-            "cursor": cursor,
-            "bounds": list(bounds),
-            "command_rows": command_rows,
-            "command_rows_bold": command_rows_bold,
-            "parse_error": parse_error,
-            "popped_in": detect_popped_in(final_rows, detect_command_bounds(final_rows, self._bounds)),
-            "pager_steps": steps,
-        }
+                raw_rows = s.render()
+                cursor = [s.screen.cursor.y, s.screen.cursor.x]
+            # outside the window context: raw_rows captured inside; snapshot
+            # again for popped_in under restored bounds
+            final_rows = self.ensure_open().render()
+            return {
+                "line": line,
+                "raw": bytes(raw),
+                "raw_rows": raw_rows,
+                "pre_rows": pre_rows,
+                "final_rows": final_rows,
+                "cursor": cursor,
+                "bounds": list(bounds),
+                "command_rows": command_rows,
+                "command_rows_bold": command_rows_bold,
+                "parse_error": parse_error,
+                "popped_in": detect_popped_in(final_rows, detect_command_bounds(final_rows, self._bounds)),
+                "pager_steps": steps,
+            }
 
     @contextlib.contextmanager
     def _window_context(self, expand: bool) -> Iterator[None]:

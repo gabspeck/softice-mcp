@@ -27,6 +27,11 @@ from .parsers import (
     parse_mod_table,
     parse_register_dump,
 )
+from .profiling import (
+    install as install_profiler,
+    span,
+    uninstall as uninstall_profiler,
+)
 
 SERVER_INFO = {"name": "softice-mcp", "version": "0.1.0"}
 
@@ -201,54 +206,73 @@ class MCPServer:
     # ---- tool table ----------------------------------------------
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if name == "connect":
-            return self._tool_connect(arguments)
-        if name == "popup":
-            return self._tool_popup(arguments)
-        if name == "resume":
-            return self._tool_resume(arguments)
-        if name == "wait_for_popup":
-            return self._tool_wait_for_popup(arguments)
-        if name == "disconnect":
-            return self._tool_disconnect(arguments)
-        if name == "screen":
-            return self._tool_screen(arguments)
-        if name == "raw_cmd":
-            return self._tool_raw_cmd(arguments)
-        if name == "send_keys":
-            return self._tool_send_keys(arguments)
-        if name == "step":
-            return self._tool_flow("T", arguments, label="step")
-        if name == "step_over":
-            return self._tool_flow("P", arguments, label="step_over")
-        if name == "go_until":
-            return self._tool_go_until(arguments)
-        if name == "registers":
-            return self._tool_registers(arguments)
-        if name == "read_memory":
-            return self._tool_read_memory(arguments)
-        if name == "disassemble":
-            return self._tool_disassemble(arguments)
-        if name == "eval_expr":
-            return self._tool_eval_expr(arguments)
-        if name == "addr_context":
-            return self._tool_addr_context(arguments)
-        if name == "module_info":
-            return self._tool_module_info(arguments)
-        if name == "bp_set":
-            return self._tool_bp_set(arguments)
-        if name == "bp_list":
-            return self._tool_bp_list(arguments)
-        if name == "bp_mutate":
-            return self._tool_bp_mutate(arguments)
-        raise ValueError(f"unknown tool {name!r}")
+        with span(f"tool.{name}", args_keys=sorted(arguments.keys())):
+            if name == "connect":
+                return self._tool_connect(arguments)
+            if name == "popup":
+                return self._tool_popup(arguments)
+            if name == "resume":
+                return self._tool_resume(arguments)
+            if name == "wait_for_popup":
+                return self._tool_wait_for_popup(arguments)
+            if name == "disconnect":
+                return self._tool_disconnect(arguments)
+            if name == "screen":
+                return self._tool_screen(arguments)
+            if name == "raw_cmd":
+                return self._tool_raw_cmd(arguments)
+            if name == "send_keys":
+                return self._tool_send_keys(arguments)
+            if name == "step":
+                return self._tool_flow("T", arguments, label="step")
+            if name == "step_over":
+                return self._tool_flow("P", arguments, label="step_over")
+            if name == "go_until":
+                return self._tool_go_until(arguments)
+            if name == "registers":
+                return self._tool_registers(arguments)
+            if name == "read_memory":
+                return self._tool_read_memory(arguments)
+            if name == "disassemble":
+                return self._tool_disassemble(arguments)
+            if name == "eval_expr":
+                return self._tool_eval_expr(arguments)
+            if name == "addr_context":
+                return self._tool_addr_context(arguments)
+            if name == "module_info":
+                return self._tool_module_info(arguments)
+            if name == "bp_set":
+                return self._tool_bp_set(arguments)
+            if name == "bp_list":
+                return self._tool_bp_list(arguments)
+            if name == "bp_mutate":
+                return self._tool_bp_mutate(arguments)
+            raise ValueError(f"unknown tool {name!r}")
 
     # ---- session / raw -------------------------------------------
 
     def _tool_connect(self, args: dict[str, Any]) -> dict[str, Any]:
         path = self._require_string(args, "path")
+        profile_log = args.get("profile_log")
+        note: str | None = None
+        if profile_log is not None:
+            if not isinstance(profile_log, str) or not profile_log.strip():
+                raise ValueError("profile_log must be a non-empty string path")
+            _, note = install_profiler(profile_log)
+            if note is None:
+                note = f"profile_log enabled: {profile_log}"
+        else:
+            uninstall_profiler()
         result = self._driver.connect(path)
-        return {"ok": True, "parsed": result, "parse_error": None, "popped_in": False}
+        env: dict[str, Any] = {
+            "ok": True,
+            "parsed": result,
+            "parse_error": None,
+            "popped_in": False,
+        }
+        if note:
+            env["note"] = note
+        return env
 
     def _tool_popup(self, args: dict[str, Any]) -> dict[str, Any]:
         timeout = self._optional_float(args, "timeout", 1.5)
@@ -284,6 +308,7 @@ class MCPServer:
 
     def _tool_disconnect(self, args: dict[str, Any]) -> dict[str, Any]:
         result = self._driver.disconnect()
+        uninstall_profiler()
         return {"ok": True, "parsed": result, "parse_error": None, "popped_in": False}
 
     def _tool_screen(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -315,7 +340,8 @@ class MCPServer:
         for _ in range(count):
             last_snap = self._driver.cmd_with_extract(cmd, timeout=1.5, expand_window=False)
         assert last_snap is not None
-        reg = parse_register_dump(last_snap["raw_rows"])
+        with span("parse.parse_register_dump", rows=len(last_snap["raw_rows"])):
+            reg = parse_register_dump(last_snap["raw_rows"])
         return _parsed_envelope(
             last_snap,
             parsed={"label": label, "count": count, "registers": reg["parsed"]},
@@ -333,7 +359,8 @@ class MCPServer:
     def _tool_registers(self, args: dict[str, Any]) -> dict[str, Any]:
         self._driver.ensure_popped()
         snap = self._driver.drain(timeout=0.3)
-        parsed = parse_register_dump(snap["raw_rows"])
+        with span("parse.parse_register_dump", rows=len(snap["raw_rows"])):
+            parsed = parse_register_dump(snap["raw_rows"])
         if parsed["parsed"]:
             return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
         # `WR` toggles the register window. Try up to twice: one toggle
@@ -341,7 +368,8 @@ class MCPServer:
         # partially painted (first WR hides it, second forces a fresh paint).
         for _ in range(2):
             snap = self._driver.raw_cmd("WR", timeout=1.0)
-            parsed = parse_register_dump(snap["raw_rows"])
+            with span("parse.parse_register_dump", rows=len(snap["raw_rows"])):
+                parsed = parse_register_dump(snap["raw_rows"])
             if parsed["parsed"]:
                 return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
         raise SoftICEStateError("Register pane not visible — SoftICE may not be popped in.")
@@ -356,7 +384,8 @@ class MCPServer:
             raise ValueError("width must be b|w|d")
         line = f"D{width.upper()} {format_address(address)} L{length:X}"
         snap = self._driver.cmd_with_extract(line, timeout=2.5, expand_window=True)
-        parsed = parse_memory_dump(snap["command_rows"])
+        with span("parse.parse_memory_dump", rows=len(snap["command_rows"])):
+            parsed = parse_memory_dump(snap["command_rows"])
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
     def _tool_disassemble(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -369,7 +398,8 @@ class MCPServer:
         # we're guaranteed at least `count` instructions, then truncate.
         line = f"U {format_address(address)} L{count * 16:X}"
         snap = self._driver.cmd_with_extract(line, timeout=2.0, expand_window=True)
-        parsed = parse_disasm(snap["command_rows"])
+        with span("parse.parse_disasm", rows=len(snap["command_rows"])):
+            parsed = parse_disasm(snap["command_rows"])
         if parsed["parsed"]:
             parsed["parsed"]["instructions"] = parsed["parsed"]["instructions"][:count]
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
@@ -379,7 +409,8 @@ class MCPServer:
         if "\n" in expr or "\r" in expr:
             raise ValueError("expr must not contain newlines")
         snap = self._driver.cmd_with_extract(f"? {expr}", timeout=1.5, expand_window=False)
-        parsed = parse_eval_result(snap["command_rows"])
+        with span("parse.parse_eval_result", rows=len(snap["command_rows"])):
+            parsed = parse_eval_result(snap["command_rows"])
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
     def _tool_addr_context(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -396,16 +427,18 @@ class MCPServer:
                 )
             return _parsed_envelope(snap, parsed={"switched_to": target})
         snap = self._driver.cmd_with_extract("ADDR", timeout=2.0, expand_window=True)
-        parsed = parse_addr_table(
-            snap["command_rows"], snap.get("command_rows_bold")
-        )
+        with span("parse.parse_addr_table", rows=len(snap["command_rows"])):
+            parsed = parse_addr_table(
+                snap["command_rows"], snap.get("command_rows_bold")
+            )
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
     def _tool_module_info(self, args: dict[str, Any]) -> dict[str, Any]:
         pattern = args.get("pattern")
         line = "MOD" if not pattern else f"MOD {str(pattern).strip()}"
         snap = self._driver.cmd_with_extract(line, timeout=3.0, expand_window=True)
-        parsed = parse_mod_table(snap["command_rows"])
+        with span("parse.parse_mod_table", rows=len(snap["command_rows"])):
+            parsed = parse_mod_table(snap["command_rows"])
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
     # ---- breakpoints --------------------------------------------
@@ -466,7 +499,8 @@ class MCPServer:
             )
 
         follow = self._driver.cmd_with_extract("BL", timeout=1.5, expand_window=True)
-        parsed_bl = parse_breakpoint_list(follow["command_rows"])
+        with span("parse.parse_breakpoint_list", rows=len(follow["command_rows"])):
+            parsed_bl = parse_breakpoint_list(follow["command_rows"])
         bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
         return _parsed_envelope(
             snap,
@@ -476,7 +510,8 @@ class MCPServer:
 
     def _tool_bp_list(self, args: dict[str, Any]) -> dict[str, Any]:
         snap = self._driver.cmd_with_extract("BL", timeout=1.5, expand_window=True)
-        parsed = parse_breakpoint_list(snap["command_rows"])
+        with span("parse.parse_breakpoint_list", rows=len(snap["command_rows"])):
+            parsed = parse_breakpoint_list(snap["command_rows"])
         bps = parsed["parsed"]["breakpoints"] if parsed["parsed"] else []
         return _parsed_envelope(snap, parsed={"breakpoints": bps})
 
@@ -498,7 +533,8 @@ class MCPServer:
         line = compose_bp_mutate(op, index)
         snap = self._driver.cmd_with_extract(line, timeout=1.5, expand_window=False)
         follow = self._driver.cmd_with_extract("BL", timeout=1.5, expand_window=True)
-        parsed_bl = parse_breakpoint_list(follow["command_rows"])
+        with span("parse.parse_breakpoint_list", rows=len(follow["command_rows"])):
+            parsed_bl = parse_breakpoint_list(follow["command_rows"])
         bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
         return _parsed_envelope(
             snap,
@@ -675,7 +711,11 @@ class MCPServer:
                     "path": {
                         "type": "string",
                         "description": "Filesystem path to the 86Box FIFO base (e.g. /tmp/softice) or one endpoint file such as /tmp/softice.in.",
-                    }
+                    },
+                    "profile_log": {
+                        "type": "string",
+                        "description": "Optional filesystem path. When set, write a JSONL profiling log with per-span timings (tool dispatch, transport, pager iterations, parsers) for diagnosing slow tool calls. Truncated each connect. Omit to disable (default).",
+                    },
                 },
                 ["path"],
             ),
