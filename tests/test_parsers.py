@@ -11,6 +11,7 @@ from softice_mcp.parsers import (
     parse_memory_dump,
     parse_mod_table,
     parse_register_dump,
+    parse_status_owner,
 )
 
 
@@ -450,6 +451,14 @@ class TestParseBreakpointList:
 
 
 class TestParseAddrTable:
+    def test_status_footer_extracts_owner(self):
+        rows = [
+            "------------------------------------VMM(01)+26A0--------------------------------",
+            ":",
+            "     Enter a command (H for help)                                       Mosview",
+        ]
+        assert parse_status_owner(rows) == "Mosview"
+
     def test_without_bold_flags_first_row_becomes_current(self):
         # SoftICE documents that the first listed context is the current one.
         rows = [
@@ -507,6 +516,22 @@ class TestParseAddrTable:
             "MSGSRV32",
             "EXPLORER",
         ]
+
+    def test_truncated_last_row_uses_status_owner(self):
+        rows = [
+            "Handle    PGTPTR    Tables  Min Addr  Max Addr  Mutex     Owner",
+            "CB1148A0  CB115040  01FC    00400000  7FFFF000  CB1148D4  Starter",
+            "CB113214  CB113FE8  01FC    00400000  7FFFF000  CB113248  Systray",
+            "CB111654  CB11166C  0002    00400000  7FFFF000  CB112048  MMTASK",
+            "CB1100CC  CB11051C  0200    00400000  7FFFF000  CB110100  Mprexe",
+            "C10D900C  C10D9024  0002    00400000  7FFFF000  C10D9050",
+        ]
+        parsed = parse_addr_table(rows, status_owner="Mosview")
+        assert parsed["parse_error"] is None
+        assert parsed["parsed"]["current"] == "Mosview"
+        assert parsed["parsed"]["contexts"][-1]["owner"] == "Mosview"
+        actives = [ctx["owner"] for ctx in parsed["parsed"]["contexts"] if ctx["active"]]
+        assert actives == ["Mosview"]
 
     def test_empty(self):
         parsed = parse_addr_table([])

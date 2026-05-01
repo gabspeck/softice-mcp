@@ -27,6 +27,7 @@ from .parsers import (
     parse_memory_dump,
     parse_mod_table,
     parse_register_dump,
+    parse_status_owner,
 )
 from .profiling import (
     install as install_profiler,
@@ -117,10 +118,12 @@ def _active_context_matches(parsed: dict[str, Any], target: str) -> bool:
     active = [ctx for ctx in contexts if ctx.get("active")]
     if active:
         return any(_context_matches_target(ctx, target) for ctx in active)
+    current = parsed.get("current")
+    if isinstance(current, str) and current.casefold() == target.casefold():
+        return True
     if contexts:
         return _context_matches_target(contexts[0], target)
-    current = parsed.get("current")
-    return isinstance(current, str) and current.casefold() == target.casefold()
+    return False
 
 
 def _address_linear_value(value: int | str | None) -> int | None:
@@ -514,9 +517,12 @@ class MCPServer:
 
     def _read_addr_contexts(self, *, timeout: float = 2.0) -> tuple[dict[str, Any], dict[str, Any]]:
         snap = self._typed_cmd_with_extract("ADDR", timeout=timeout)
+        status_owner = parse_status_owner(snap.get("raw_rows") or [])
         with span("parse.parse_addr_table", rows=len(snap["command_rows"])):
             parsed = parse_addr_table(
-                snap["command_rows"], snap.get("command_rows_bold")
+                snap["command_rows"],
+                snap.get("command_rows_bold"),
+                status_owner=status_owner,
             )
         return snap, parsed
 

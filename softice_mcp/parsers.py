@@ -15,6 +15,7 @@ from .profiling import span
 
 CommandRows = list[str]
 Grid = list[str]
+_STATUS_OWNER = re.compile(r"Enter a command \(H for help\)\s+(?P<owner>\S+)\s*$")
 
 
 # ---- extractor ---------------------------------------------------------
@@ -198,6 +199,16 @@ def has_more_pager(rows: Grid, bounds: tuple[int, int]) -> bool:
             if stripped.endswith("More?") or "press any key" in stripped.lower():
                 return True
         return False
+
+
+def parse_status_owner(rows: Grid) -> str | None:
+    """Extract the trailing status-bar label from SoftICE's command footer."""
+    with span("parser.parse_status_owner", rows=len(rows)):
+        for row in reversed(rows):
+            match = _STATUS_OWNER.search(row.rstrip())
+            if match:
+                return match.group("owner")
+        return None
 
 
 # ---- register pane (rows 0..2 in default layout) ----------------------
@@ -481,6 +492,7 @@ def parse_breakpoint_list(command_rows: CommandRows) -> dict[str, Any]:
 def parse_addr_table(
     command_rows: CommandRows,
     command_rows_bold: list[bool] | None = None,
+    status_owner: str | None = None,
 ) -> dict[str, Any]:
     # SoftICE bolds the active row in the ADDR table and only that row.
     # `command_rows_bold[i]` should line up with `command_rows[i]`; when it's
@@ -507,11 +519,27 @@ def parse_addr_table(
                 continue
             active = bool(bold[i]) if i < len(bold) else False
             owner = parts[-1]
+            if re.fullmatch(r"[0-9A-Fa-f]{6,8}", owner or ""):
+                if status_owner:
+                    owner = status_owner
+                    active = True
+                else:
+                    continue
             contexts.append(
                 {"handle": handle, "owner": owner, "active": active, "raw": stripped}
             )
             if active and current is None:
                 current = owner
+        if status_owner:
+            for ctx in contexts:
+                if str(ctx.get("owner") or "").casefold() == status_owner.casefold():
+                    for other in contexts:
+                        other["active"] = False
+                    ctx["active"] = True
+                    current = str(ctx["owner"])
+                    break
+            else:
+                current = status_owner
         if contexts and current is None:
             # SoftICE documents that the first listed context is the current
             # one. When bold metadata is unavailable or noisy, fall back to

@@ -65,11 +65,27 @@ def test_addr_context_switch_verifies_via_addr_listing(monkeypatch):
         if line == "ADDR":
             return _snap(
                 command_rows=[
-                    "Handle  Owner",
-                    "  FFBEAE58  Explorer",
-                    "  FFBEAE90  Mosview",
+                    "Handle    PGTPTR    Tables  Min Addr  Max Addr  Mutex     Owner",
+                    "CB1148A0  CB115040  01FC    00400000  7FFFF000  CB1148D4  Starter",
+                    "CB113214  CB113FE8  01FC    00400000  7FFFF000  CB113248  Systray",
+                    "CB111654  CB11166C  0002    00400000  7FFFF000  CB112048  MMTASK",
+                    "CB1100CC  CB11051C  0200    00400000  7FFFF000  CB110100  Mprexe",
+                    "C10D900C  C10D9024  0002    00400000  7FFFF000  C10D9050",
                 ],
-                command_rows_bold=[False, False, True],
+                raw_rows=[
+                    "                                                F10",
+                    " ADDR Mosview",
+                    "",
+                    " ADDR",
+                    "Handle    PGTPTR    Tables  Min Addr  Max Addr  Mutex     Owner",
+                    "CB1148A0  CB115040  01FC    00400000  7FFFF000  CB1148D4  Starter",
+                    "CB113214  CB113FE8  01FC    00400000  7FFFF000  CB113248  Systray",
+                    "CB111654  CB11166C  0002    00400000  7FFFF000  CB112048  MMTASK",
+                    "CB1100CC  CB11051C  0200    00400000  7FFFF000  CB110100  Mprexe",
+                    "C10D900C  C10D9024  0002    00400000  7FFFF000  C10D9050",
+                    "",
+                    "     Enter a command (H for help)                                       Mosview",
+                ],
             )
         raise AssertionError(line)
 
