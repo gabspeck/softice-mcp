@@ -106,7 +106,7 @@ def test_cmd_sends_reset_cr_then_command_through_paced_path(monkeypatch):
 
     monkeypatch.setattr(sice, "_send_paced", lambda data: sent.append(bytes(data)))
 
-    def fake_drain(timeout: float = 1.5, settle: float = 0.35) -> bytes:
+    def fake_drain(timeout: float = 1.5, settle: float = 0.35, is_done=None) -> bytes:
         drains.append((timeout, settle))
         return b"screen"
 
@@ -115,7 +115,7 @@ def test_cmd_sends_reset_cr_then_command_through_paced_path(monkeypatch):
     raw = sice.cmd("TABLE", timeout=2.0)
 
     assert sent == [b"\r", b"TABLE\r"]
-    assert drains == [(0.3, 0.15), (2.0, 0.35)]
+    assert drains == [(0.3, 0.05), (2.0, 0.35)]
     assert raw == b"screen"
 
 
@@ -126,7 +126,11 @@ def test_popup_sends_ctrl_d_through_paced_path(monkeypatch):
     sent: list[bytes] = []
 
     monkeypatch.setattr(sice, "_send_paced", lambda data: sent.append(bytes(data)))
-    monkeypatch.setattr(sice, "drain", lambda timeout=1.5, settle=0.35: b"popup")
+    monkeypatch.setattr(
+        sice,
+        "drain",
+        lambda timeout=1.5, settle=0.35, is_done=None: b"popup",
+    )
 
     raw = sice.popup(timeout=0.5)
 

@@ -28,6 +28,7 @@ DEFAULT_COMMAND_BOUNDS: tuple[int, int] = (17, 24)
 EXPANDED_COMMAND_BOUNDS: tuple[int, int] = (4, 24)
 DEFAULT_CODE_LINES = 8
 DEFAULT_DATA_LINES = 8
+DEFAULT_SEND_KEYS_DRAIN_TIMEOUT = 0.6
 
 MAX_PAGER_STEPS = 32
 
@@ -131,7 +132,12 @@ class SoftICEDriver:
 
     # ---- primitives --------------------------------------------------
 
-    def send_keys(self, data: bytes | str, drain_timeout: float = 0.0, settle: float = 0.15) -> dict[str, Any]:
+    def send_keys(
+        self,
+        data: bytes | str,
+        drain_timeout: float = DEFAULT_SEND_KEYS_DRAIN_TIMEOUT,
+        settle: float = 0.15,
+    ) -> dict[str, Any]:
         self._retry_once("send_keys", data)
         raw = b""
         if drain_timeout > 0:

@@ -50,7 +50,7 @@ class FakeSoftICE:
         self.fd = None
         self.closes += 1
 
-    def cmd(self, line: str, timeout: float = 1.5) -> bytes:
+    def cmd(self, line: str, timeout: float = 1.5, is_done=None) -> bytes:
         self.cmd_calls.append(line)
         if self.fail_next_cmd is not None:
             exc, self.fail_next_cmd = self.fail_next_cmd, None
@@ -63,14 +63,14 @@ class FakeSoftICE:
             exc, self.fail_next_cmd = self.fail_next_cmd, None
             raise exc
 
-    def drain(self, timeout: float = 0.6, settle: float = 0.2) -> bytes:
+    def drain(self, timeout: float = 0.6, settle: float = 0.2, is_done=None) -> bytes:
         self.drain_calls += 1
         if self.fail_next_drain is not None:
             exc, self.fail_next_drain = self.fail_next_drain, None
             raise exc
         return b""
 
-    def popup(self, timeout: float = 1.5) -> bytes:
+    def popup(self, timeout: float = 1.5, is_done=None) -> bytes:
         return b""
 
     def render(self) -> list[str]:
@@ -177,7 +177,7 @@ class TestReconnect:
         drv.connect("/tmp/softice")
         original_cmd = FakeSoftICE.cmd
 
-        def always_fail(self, line, timeout=1.5):
+        def always_fail(self, line, timeout=1.5, is_done=None):
             raise OSError(errno.EBADF, "still broken")
 
         monkeypatch.setattr(FakeSoftICE, "cmd", always_fail)
@@ -202,6 +202,30 @@ class TestSnapshot:
         result = drv.raw_cmd("R", timeout=0.1)
         assert "popped_in" in result
         assert result["cursor"] == [24, 0]
+
+
+class TestSendKeys:
+    def test_drains_by_default(self, fake_softice):
+        drv = SoftICEDriver()
+        drv.connect("/tmp/softice")
+
+        drv.send_keys("A")
+
+        inst = fake_softice.instances[0]
+        assert inst.send_calls == [b"A"]
+        assert inst.drain_calls == 1
+
+    def test_explicit_zero_timeout_skips_drain(self, fake_softice):
+        drv = SoftICEDriver()
+        drv.connect("/tmp/softice")
+        drv._popped_in = True
+
+        drv.send_keys("A", drain_timeout=0.0)
+
+        inst = fake_softice.instances[0]
+        assert inst.send_calls == [b"A"]
+        assert inst.drain_calls == 0
+        assert drv._popped_in is None
 
 
 class TestWaitForPopup:

@@ -14,6 +14,7 @@ from .bp_composer import (
     format_address,
 )
 from .driver import (
+    DEFAULT_SEND_KEYS_DRAIN_TIMEOUT,
     SoftICEDriver,
     SoftICEIOError,
     SoftICEStateError,
@@ -325,7 +326,13 @@ class MCPServer:
 
     def _tool_send_keys(self, args: dict[str, Any]) -> dict[str, Any]:
         keys = self._require_string(args, "keys")
-        drain_timeout = self._optional_float(args, "drain_timeout", 0.0) or 0.0
+        drain_timeout = self._optional_float(
+            args,
+            "drain_timeout",
+            DEFAULT_SEND_KEYS_DRAIN_TIMEOUT,
+        )
+        if drain_timeout is None:
+            drain_timeout = DEFAULT_SEND_KEYS_DRAIN_TIMEOUT
         decoded = keys.encode("latin-1").decode("unicode_escape")
         snap = self._driver.send_keys(decoded, drain_timeout=drain_timeout)
         return _raw_envelope(snap, parsed={"sent_bytes": len(decoded)})
@@ -795,7 +802,11 @@ class MCPServer:
                 "Escape hatch: write raw bytes to the transport (no CR appended). Escapes supported: \\r \\n \\t \\e \\x04. Use only for byte-level input no other tool can produce — arrow-key navigation (BH list), ESC to dismiss pagers, function keys, chained Ctrl-sequences. For command lines use `raw_cmd`; for structured debugger ops use the typed tools. State in one sentence why no typed tool fits before issuing.",
                 {
                     "keys": {"type": "string"},
-                    "drain_timeout": {"type": "number"},
+                    "drain_timeout": {
+                        "type": "number",
+                        "default": DEFAULT_SEND_KEYS_DRAIN_TIMEOUT,
+                        "description": "Seconds to wait for post-key repaint before snapshotting; set to 0 to skip draining.",
+                    },
                 },
                 ["keys"],
             ),
