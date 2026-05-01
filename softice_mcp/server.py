@@ -43,6 +43,18 @@ REMINDER_ADDR = (
     "For user-range addresses (0x00400000..0x7FFFFFFF) pass `context` so the BP "
     "arms in the correct process space; otherwise it will silently miss."
 )
+_EXPLICIT_SOFTICE_ERROR_SNIPPETS = (
+    "invalid ",
+    "syntax error",
+    "value is too large",
+    "not found",
+    "unknown command",
+    "unknown symbol",
+    "illegal",
+    "bad ",
+    "expected ",
+    "requires ",
+)
 
 
 def _debug_log(message: str) -> None:
@@ -53,14 +65,133 @@ def _encode_raw(raw: bytes) -> str:
     return raw[:512].hex() if raw else ""
 
 
+def _filtered_command_rows(command_rows: list[str]) -> list[str]:
+    out: list[str] = []
+    for row in command_rows:
+        stripped = row.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("winice:"):
+            continue
+        if "windows is active" in lowered:
+            continue
+        out.append(stripped)
+    return out
+
+
 def _command_output_message(command_rows: list[str]) -> str:
-    """Collapse command_rows into a single-line error message, or "" if empty.
+    """Collapse meaningful command_rows into a single-line message, or ""."""
+    return " ".join(_filtered_command_rows(command_rows))
+
+
+def _command_error_message(command_rows: list[str]) -> str:
+    """Return an explicit SoftICE error row, ignoring benign transport noise.
 
     BPX/BPM/BPIO/BPINT and ADDR <name> are silent on success, so any content
-    in command_rows is SoftICE complaining (Invalid Context Handle, Syntax
-    error, Invalid Address, etc.).
+    is suspicious, but not every captured row belongs to the command itself.
+    Background WinICE logs and detached-state status lines should not make a
+    typed tool fail.
     """
-    return " ".join(s for s in (r.strip() for r in command_rows) if s)
+    for stripped in _filtered_command_rows(command_rows):
+        lowered = stripped.lower()
+        if any(snippet in lowered for snippet in _EXPLICIT_SOFTICE_ERROR_SNIPPETS):
+            return stripped
+    return ""
+
+
+def _context_matches_target(context: dict[str, Any], target: str) -> bool:
+    owner = str(context.get("owner") or "")
+    if owner and owner.casefold() == target.casefold():
+        return True
+    try:
+        handle = int(target, 16)
+    except ValueError:
+        return False
+    return context.get("handle") == handle
+
+
+def _active_context_matches(parsed: dict[str, Any], target: str) -> bool:
+    contexts = parsed.get("contexts") or []
+    active = [ctx for ctx in contexts if ctx.get("active")]
+    if active:
+        return any(_context_matches_target(ctx, target) for ctx in active)
+    if contexts:
+        return _context_matches_target(contexts[0], target)
+    current = parsed.get("current")
+    return isinstance(current, str) and current.casefold() == target.casefold()
+
+
+def _address_linear_value(value: int | str | None) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        rendered = format_address(value)
+    except ValueError:
+        return None
+    try:
+        return int(rendered.split(":")[-1], 16)
+    except ValueError:
+        return None
+
+
+def _breakpoint_target_matches(
+    bp: dict[str, Any],
+    *,
+    kind: str,
+    address: int | str | None,
+    size: str | None,
+    verb: str | None,
+    port: int | None,
+    intno: int | None,
+) -> bool:
+    actual_kind = str(bp.get("kind") or "").upper()
+    if kind == "bpx":
+        if address is None or actual_kind != "BPX":
+            return False
+        actual_token = str(bp.get("target") or "").split()[0]
+        actual = format_address(actual_token)
+        expected = format_address(address)
+        if ":" in expected:
+            return actual == expected
+        return actual.split(":")[-1] == expected
+    if kind == "bpm":
+        if address is None or size is None or verb is None:
+            return False
+        if actual_kind != f"BPM{size.upper()}":
+            return False
+        parts = str(bp.get("target") or "").split()
+        if not parts:
+            return False
+        actual = format_address(parts[0])
+        expected = format_address(address)
+        actual_verb = parts[1].upper() if len(parts) > 1 else ""
+        if ":" in expected:
+            return actual == expected and actual_verb == verb.upper()
+        return actual.split(":")[-1] == expected and actual_verb == verb.upper()
+    if kind == "bpio":
+        if port is None or verb is None or actual_kind != "BPIO":
+            return False
+        parts = str(bp.get("target") or "").split()
+        if not parts:
+            return False
+        try:
+            actual_port = int(parts[0], 16)
+        except ValueError:
+            return False
+        actual_verb = parts[1].upper() if len(parts) > 1 else ""
+        return actual_port == port and actual_verb == verb.upper()
+    if kind == "bpint":
+        if intno is None or actual_kind != "BPINT":
+            return False
+        try:
+            actual_intno = int(str(bp.get("target") or "").split()[0], 16)
+        except (IndexError, ValueError):
+            return False
+        return actual_intno == intno
+    return False
 
 
 def _raw_envelope(
@@ -420,6 +551,14 @@ class MCPServer:
             parsed = parse_eval_result(snap["command_rows"])
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
+    def _read_addr_contexts(self, *, timeout: float = 2.0) -> tuple[dict[str, Any], dict[str, Any]]:
+        snap = self._driver.cmd_with_extract("ADDR", timeout=timeout, expand_window=False)
+        with span("parse.parse_addr_table", rows=len(snap["command_rows"])):
+            parsed = parse_addr_table(
+                snap["command_rows"], snap.get("command_rows_bold")
+            )
+        return snap, parsed
+
     def _tool_addr_context(self, args: dict[str, Any]) -> dict[str, Any]:
         name = args.get("name")
         if name:
@@ -427,17 +566,25 @@ class MCPServer:
             snap = self._driver.cmd_with_extract(
                 f"ADDR {target}", timeout=2.0, expand_window=False
             )
-            message = _command_output_message(snap["command_rows"])
-            if message:
+            verify_snap, parsed = self._read_addr_contexts(timeout=2.0)
+            if parsed["parsed"] and _active_context_matches(parsed["parsed"], target):
+                current = parsed["parsed"].get("current") or target
                 return _parsed_envelope(
-                    snap, parsed=None, parse_error="switch_failed", note=message,
+                    verify_snap,
+                    parsed={"switched_to": current},
                 )
-            return _parsed_envelope(snap, parsed={"switched_to": target})
-        snap = self._driver.cmd_with_extract("ADDR", timeout=2.0, expand_window=True)
-        with span("parse.parse_addr_table", rows=len(snap["command_rows"])):
-            parsed = parse_addr_table(
-                snap["command_rows"], snap.get("command_rows_bold")
+            message = (
+                _command_error_message(snap["command_rows"])
+                or _command_output_message(snap["command_rows"])
+                or parsed["parse_error"]
             )
+            return _parsed_envelope(
+                verify_snap,
+                parsed={"attempted": target},
+                parse_error="switch_failed",
+                note=message,
+            )
+        snap, parsed = self._read_addr_contexts(timeout=2.0)
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
     def _tool_module_info(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -476,56 +623,79 @@ class MCPServer:
         return_breakpoints = bool(args.get("return_breakpoints", False))
 
         note: str | None = None
-        if kind in ("bpx", "bpm") and isinstance(address, int):
-            if 0x00400000 <= address <= 0x7FFFFFFF and not context:
+        linear_address = _address_linear_value(address)
+        if kind in ("bpx", "bpm") and linear_address is not None:
+            if 0x00400000 <= linear_address <= 0x7FFFFFFF and not context:
                 note = REMINDER_ADDR
 
-        # Hoist the expanded Command window over the entire ADDR/BPX/BL flow so
-        # we pay one WC/WD restore round-trip total instead of one per inner
-        # cmd_with_extract that would otherwise set expand_window=True.
-        with self._driver.expanded_command_window():
-            # SoftICE 3.x rejects `ADDR x; BPX y` compound with Invalid Context
-            # Handle — switch has to commit before BPX runs. Issue as two commands.
-            if addr_line is not None:
-                addr_snap = self._driver.cmd_with_extract(
-                    addr_line, timeout=2.0, expand_window=False
-                )
-                addr_msg = _command_output_message(addr_snap["command_rows"])
-                if addr_msg:
-                    return _parsed_envelope(
-                        addr_snap,
-                        parsed={"issued": [addr_line]},
-                        parse_error="addr_switch_failed",
-                        note=addr_msg,
-                    )
-
-            snap = self._driver.cmd_with_extract(
-                bp_line, timeout=2.0, expand_window=False
+        # SoftICE 3.x rejects `ADDR x; BPX y` compound with Invalid Context
+        # Handle — switch has to commit before BPX runs. Issue as two commands.
+        if addr_line is not None:
+            addr_snap = self._driver.cmd_with_extract(
+                addr_line, timeout=2.0, expand_window=False
             )
-            # BPX/BPM/BPIO/BPINT are silent on success; non-empty output is SoftICE
-            # rejecting the command (e.g. "Invalid Address", "Syntax error").
-            bp_msg = _command_output_message(snap["command_rows"])
-            issued = [addr_line, bp_line] if addr_line else [bp_line]
-            if bp_msg:
+            addr_msg = _command_error_message(addr_snap["command_rows"])
+            if addr_msg:
                 return _parsed_envelope(
-                    snap,
-                    parsed={"issued": issued},
-                    parse_error="bpx_rejected",
-                    note=bp_msg,
+                    addr_snap,
+                    parsed={"issued": [addr_line]},
+                    parse_error="addr_switch_failed",
+                    note=addr_msg,
                 )
 
-            parsed: dict[str, Any] = {"issued": issued}
+        snap = self._driver.cmd_with_extract(
+            bp_line, timeout=2.0, expand_window=False
+        )
+        bp_msg = _command_error_message(snap["command_rows"])
+        issued = [addr_line, bp_line] if addr_line else [bp_line]
+        must_verify_breakpoint = kind in ("bpio", "bpint") or (
+            kind in ("bpx", "bpm") and linear_address is not None
+        )
+        fetch_breakpoints = return_breakpoints or must_verify_breakpoint
+
+        parsed: dict[str, Any] = {"issued": issued}
+        if fetch_breakpoints:
+            follow = self._driver.cmd_with_extract(
+                "BL", timeout=1.5, expand_window=False
+            )
+            with span(
+                "parse.parse_breakpoint_list",
+                rows=len(follow["command_rows"]),
+            ):
+                parsed_bl = parse_breakpoint_list(follow["command_rows"])
+            bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
             if return_breakpoints:
-                follow = self._driver.cmd_with_extract(
-                    "BL", timeout=1.5, expand_window=False
-                )
-                with span(
-                    "parse.parse_breakpoint_list",
-                    rows=len(follow["command_rows"]),
-                ):
-                    parsed_bl = parse_breakpoint_list(follow["command_rows"])
-                bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
                 parsed["breakpoints"] = bps
+            if must_verify_breakpoint:
+                if any(
+                    _breakpoint_target_matches(
+                        bp,
+                        kind=kind,
+                        address=address,
+                        size=args.get("size"),
+                        verb=args.get("verb"),
+                        port=args.get("port"),
+                        intno=args.get("intno"),
+                    )
+                    for bp in bps
+                ):
+                    return _parsed_envelope(snap, parsed=parsed, note=note)
+                missing_note = bp_msg or _command_output_message(snap["command_rows"])
+                if not missing_note:
+                    missing_note = "Breakpoint did not appear in `BL` after set."
+                return _parsed_envelope(
+                    follow,
+                    parsed=parsed,
+                    parse_error="bpx_rejected",
+                    note=missing_note,
+                )
+        if bp_msg:
+            return _parsed_envelope(
+                snap,
+                parsed=parsed,
+                parse_error="bpx_rejected",
+                note=bp_msg,
+            )
         return _parsed_envelope(snap, parsed=parsed, note=note)
 
     def _tool_bp_list(self, args: dict[str, Any]) -> dict[str, Any]:

@@ -23,6 +23,21 @@ class TestFormatAddress:
     def test_string_trimmed(self):
         assert format_address("  cs:eip  ") == "cs:eip"
 
+    def test_decimal_string_canonicalized_to_hex(self):
+        assert format_address("2122919952") == "7E893010"
+
+    def test_hex_string_canonicalized_to_hex(self):
+        assert format_address("7E893010") == "7E893010"
+
+    def test_selector_offset_string_canonicalized(self):
+        assert format_address("#0028:7E893010") == "#0028:7E893010"
+
+    def test_selector_offset_with_prefixed_selector_is_normalized(self):
+        assert format_address("0x1b:0x401200") == "1B:401200"
+
+    def test_letter_prefixed_hex_like_token_preserved_as_symbol(self):
+        assert format_address("ABC") == "ABC"
+
     def test_negative_int_rejected(self):
         with pytest.raises(ValueError, match="non-negative"):
             format_address(-1)

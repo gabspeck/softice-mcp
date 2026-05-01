@@ -450,8 +450,8 @@ class TestParseBreakpointList:
 
 
 class TestParseAddrTable:
-    def test_without_bold_flags_nothing_active(self):
-        # No bold info: parser returns contexts but can't identify active.
+    def test_without_bold_flags_first_row_becomes_current(self):
+        # SoftICE documents that the first listed context is the current one.
         rows = [
             "Handle  Owner",
             "  FFBEAE58  MSGSRV32",
@@ -460,9 +460,9 @@ class TestParseAddrTable:
         ]
         parsed = parse_addr_table(rows)
         assert parsed["parse_error"] is None
-        assert parsed["parsed"]["current"] is None
+        assert parsed["parsed"]["current"] == "MSGSRV32"
         assert len(parsed["parsed"]["contexts"]) == 3
-        assert all(not c["active"] for c in parsed["parsed"]["contexts"])
+        assert parsed["parsed"]["contexts"][0]["active"] is True
 
     def test_bold_row_marks_active_and_sets_current(self):
         # SoftICE bolds the whole active row — bold list is index-aligned
@@ -489,8 +489,24 @@ class TestParseAddrTable:
             "  FFBEAE90  EXPLORER",
         ]
         parsed = parse_addr_table(rows, [False, False])  # EXPLORER uncovered
-        assert parsed["parsed"]["current"] is None
-        assert all(not c["active"] for c in parsed["parsed"]["contexts"])
+        assert parsed["parsed"]["current"] == "MSGSRV32"
+        assert parsed["parsed"]["contexts"][0]["active"] is True
+
+    def test_ignores_winice_noise_rows(self):
+        rows = [
+            "WINICE: Load32 KERNEL32",
+            "WINICE: LogError ERR_00",
+            "Handle  Owner",
+            "  FFBEAE58  MSGSRV32",
+            "Windows is active, press CTRL Z to pop up WINICE",
+            "  FFBEAE90  EXPLORER",
+        ]
+        parsed = parse_addr_table(rows)
+        assert parsed["parse_error"] is None
+        assert [ctx["owner"] for ctx in parsed["parsed"]["contexts"]] == [
+            "MSGSRV32",
+            "EXPLORER",
+        ]
 
     def test_empty(self):
         parsed = parse_addr_table([])

@@ -512,6 +512,12 @@ def parse_addr_table(
             )
             if active and current is None:
                 current = owner
+        if contexts and current is None:
+            # SoftICE documents that the first listed context is the current
+            # one. When bold metadata is unavailable or noisy, fall back to
+            # that ordering instead of reporting an unknown current context.
+            contexts[0]["active"] = True
+            current = contexts[0]["owner"]
         if not contexts:
             return {"parsed": None, "parse_error": "no_contexts", "rows": list(command_rows)}
         return {

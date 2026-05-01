@@ -19,19 +19,50 @@ Refusal / validation:
 from __future__ import annotations
 
 from collections.abc import Iterable
+import re
 
 VALID_KINDS = {"bpx", "bpm", "bpio", "bpint"}
 VALID_BPM_SIZES = {"b", "w", "d"}
 VALID_BPM_VERBS = {"r", "w", "rw", "x"}
 VALID_BPIO_VERBS = {"r", "w", "rw"}
 
+_NUMERIC_ADDRESS_RE = re.compile(r"^(?:0x[0-9A-Fa-f]+|[0-9]+|[0-9][0-9A-Fa-f]*)$")
+_SELECTOR_OFFSET_RE = re.compile(
+    r"^(?P<selector>#?(?:0x[0-9A-Fa-f]+|[0-9][0-9A-Fa-f]*)):"
+    r"(?P<offset>(?:0x[0-9A-Fa-f]+|[0-9]+|[0-9][0-9A-Fa-f]*))$"
+)
+
+
+def _format_numeric_address_token(token: str) -> str:
+    if token.lower().startswith("0x"):
+        value = int(token, 16)
+    elif token.isdigit():
+        value = int(token, 10)
+    else:
+        value = int(token, 16)
+    return f"{value:X}"
+
+
+def _normalize_selector_token(token: str) -> str:
+    prefix = "#" if token.startswith("#") else ""
+    body = token[1:] if prefix else token
+    if body.lower().startswith("0x"):
+        body = f"{int(body, 16):X}"
+    else:
+        body = body.upper()
+    return f"{prefix}{body}"
+
 
 def format_address(value: int | str) -> str:
     """Render an address the way SoftICE wants.
 
-    Integers → uppercase hex without ``0x`` prefix (``401234`` not ``0x401234``).
-    Strings pass through unchanged so callers can use ``MODULE!symbol``,
-    ``cs:eip``, or decimal as needed.
+    Numeric addresses are normalized to uppercase hexadecimal in SoftICE's
+    native bare form, so decimal inputs such as ``2122919952`` become
+    ``7E893010`` without injecting a ``0x`` prefix into command positions
+    where SoftICE rejects it.
+
+    Symbolic / expression strings pass through unchanged so callers can still
+    use ``MODULE!symbol``, ``cs:eip``, ``eip+10``, or ``.1234``.
     """
     if isinstance(value, bool):
         raise ValueError("address must be an int or string, not bool")
@@ -45,6 +76,13 @@ def format_address(value: int | str) -> str:
             raise ValueError("address string must be non-empty")
         if "\n" in s or "\r" in s:
             raise ValueError("address string must not contain newlines")
+        selector_match = _SELECTOR_OFFSET_RE.match(s)
+        if selector_match is not None:
+            selector = _normalize_selector_token(selector_match.group("selector"))
+            offset = _format_numeric_address_token(selector_match.group("offset"))
+            return f"{selector}:{offset}"
+        if _NUMERIC_ADDRESS_RE.match(s):
+            return _format_numeric_address_token(s)
         return s
     raise ValueError(f"address must be int or str, got {type(value).__name__}")
 
