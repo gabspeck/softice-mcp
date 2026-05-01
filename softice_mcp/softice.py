@@ -342,6 +342,18 @@ class SoftICE:
                 for y in range(self.screen.lines)
             ]
 
+    def clear_render_state(self) -> None:
+        """Forget the current VT100 screen image.
+
+        After `G` / resume the serial UI is effectively detached, so any
+        still-painted prompt/code/register rows are stale local state until
+        SoftICE is popped again.
+        """
+        rows = self.screen.lines
+        cols = self.screen.columns
+        self.screen = pyte.Screen(cols, rows)
+        self.stream = pyte.Stream(self.screen)
+
 
 def _format_screen(rows: list[str]) -> str:
     width = max((len(r) for r in rows), default=0)

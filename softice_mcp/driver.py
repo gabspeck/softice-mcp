@@ -2,9 +2,8 @@
 
 Owns the single pyte-backed transport connection, handles one-shot reconnect
 on bad-fd errors, exposes a ``cmd_with_extract`` primitive that slices command
-output out of the 80x25 grid, and provides a context manager that hides the
-Code/Data panes so long output can land in a 21-row Command window without
-triggering SoftICE's ``Press any key...`` pager.
+output out of the 80x25 grid, and assumes SoftICE starts in a maximized
+command-window layout with the non-command panes disabled by startup settings.
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ from __future__ import annotations
 import contextlib
 import errno
 import time
-from collections.abc import Iterator
 from typing import Any
 
 from .parsers import (
@@ -24,10 +22,7 @@ from .parsers import (
 from .profiling import span
 from .softice import SoftICE
 
-DEFAULT_COMMAND_BOUNDS: tuple[int, int] = (17, 24)
-EXPANDED_COMMAND_BOUNDS: tuple[int, int] = (4, 24)
-DEFAULT_CODE_LINES = 8
-DEFAULT_DATA_LINES = 8
+MAXIMIZED_COMMAND_BOUNDS: tuple[int, int] = (0, 24)
 DEFAULT_SEND_KEYS_DRAIN_TIMEOUT = 0.6
 
 MAX_PAGER_STEPS = 32
@@ -53,8 +48,9 @@ class SoftICEDriver:
     def __init__(self) -> None:
         self._path: str | None = None
         self._sice: SoftICE | None = None
-        self._bounds: tuple[int, int] = DEFAULT_COMMAND_BOUNDS
+        self._bounds: tuple[int, int] = MAXIMIZED_COMMAND_BOUNDS
         self._popped_in: bool | None = None
+        self._layout_initialized = False
 
     # ---- lifecycle ---------------------------------------------------
 
@@ -74,8 +70,9 @@ class SoftICEDriver:
         sice = SoftICE(path=path)
         sice.open()
         self._sice = sice
-        self._bounds = DEFAULT_COMMAND_BOUNDS
+        self._bounds = MAXIMIZED_COMMAND_BOUNDS
         self._popped_in = None
+        self._layout_initialized = False
         return {"path": path, "connected": True}
 
     def ensure_open(self) -> SoftICE:
@@ -100,6 +97,7 @@ class SoftICEDriver:
         self._sice = None
         self._path = None
         self._popped_in = None
+        self._layout_initialized = False
         return {"was_open": had}
 
     def _retry_once(self, method: str, *args: Any, **kwargs: Any) -> Any:
@@ -158,6 +156,26 @@ class SoftICEDriver:
         )
         return self._snapshot(raw)
 
+    def resume(self, line: str) -> dict[str, Any]:
+        """Send `G` (optionally with an address) and mark the session detached.
+
+        There is no useful prompt or stable VT100 screen to snapshot after a
+        successful resume; keeping the old rendered prompt around only poisons
+        the next popped/detached state probe.
+        """
+        self.ensure_popped()
+        self._retry_once("send_keys", f"\r{line}\r")
+        self.ensure_open().clear_render_state()
+        self._popped_in = False
+        return {
+            "raw": b"",
+            "raw_rows": [],
+            "cursor": [0, 0],
+            "bounds": list(self._bounds),
+            "popped_in": False,
+            "line": line,
+        }
+
     def drain(self, timeout: float = 0.6, settle: float = 0.2) -> dict[str, Any]:
         raw = self._retry_once(
             "drain",
@@ -203,8 +221,8 @@ class SoftICEDriver:
         return False
 
     def popup(self, timeout: float = 1.5) -> dict[str, Any]:
-        raw = self._retry_once("popup", timeout=timeout)
-        return self._snapshot(raw)
+        sent = self.ensure_popped(timeout=timeout)
+        return self._snapshot(b"\x04" if sent else b"")
 
     def wait_for_popup(
         self,
@@ -270,6 +288,7 @@ class SoftICEDriver:
         the probe says we're genuinely detached.
         """
         if self.drain(timeout=0.1, settle=0.05)["popped_in"]:
+            self._ensure_session_layout()
             return False
         # We confirmed detached above, so the desired end state is unambiguous:
         # exit drain as soon as detect_popped_in() flips True. Safe because the
@@ -280,6 +299,7 @@ class SoftICEDriver:
             timeout=timeout,
             is_done=lambda: self._observed_popped_in(),
         )
+        self._ensure_session_layout()
         return True
 
     def _observed_popped_in(self) -> bool:
@@ -290,46 +310,27 @@ class SoftICEDriver:
         bounds = detect_command_bounds(rows, self._bounds)
         return detect_popped_in(rows, bounds)
 
-    # ---- window management ------------------------------------------
+    # ---- startup baseline ------------------------------------------
 
-    def default_layout(self) -> None:
-        """Force the stock 4-pane layout. Idempotent.
+    def _session_cmd(self, line: str, timeout: float = 1.0) -> bytes:
+        """Run a startup-cleanup command outside the typed-tool parser flow."""
+        return self._retry_once("cmd", line, timeout=timeout)
 
-        ``WC n`` opens the Code window to n lines (or resizes it if open).
-        ``WD n`` does the same for the Data window. Reissuing with the
-        default sizes gives us a known command-area of rows 17..24.
-        """
-        is_done = lambda: self._is_prompt_settled(require_cursor=True)
-        self._retry_once("cmd", f"WC {DEFAULT_CODE_LINES}", is_done=is_done)
-        self._retry_once("cmd", f"WD {DEFAULT_DATA_LINES}", is_done=is_done)
-        self._bounds = DEFAULT_COMMAND_BOUNDS
+    def _register_row_visible(self, rows: list[str] | None = None) -> bool:
+        painted = rows if rows is not None else self.ensure_open().render()
+        return bool(painted) and painted[0].lstrip().startswith("EAX=")
 
-    @contextlib.contextmanager
-    def expanded_command_window(self) -> Iterator[None]:
-        """Hide the Code and Data panes for the duration of the block.
+    def registers_visible(self) -> bool:
+        return self._register_row_visible()
 
-        Extra rows collapse into the Command window (per WC/WD semantics in
-        si30cr.pdf p.222-223). Restores the default 4-pane layout on exit,
-        even if the wrapped call raises.
-        """
-        old_bounds = self._bounds
-        is_done = lambda: self._is_prompt_settled(require_cursor=True)
-        self._retry_once("cmd", "WC", is_done=is_done)
-        self._retry_once("cmd", "WD", is_done=is_done)
-        self._bounds = EXPANDED_COMMAND_BOUNDS
-        try:
-            yield
-        finally:
-            self._bounds = old_bounds
-            restore_done = lambda: self._is_prompt_settled(require_cursor=True)
-            with contextlib.suppress(Exception):
-                self._retry_once(
-                    "cmd", f"WC {DEFAULT_CODE_LINES}", is_done=restore_done
-                )
-            with contextlib.suppress(Exception):
-                self._retry_once(
-                    "cmd", f"WD {DEFAULT_DATA_LINES}", is_done=restore_done
-                )
+    def _ensure_session_layout(self) -> None:
+        if self._layout_initialized:
+            return
+        rows = self.ensure_open().render()
+        if self._register_row_visible(rows):
+            self._session_cmd("WR")
+        self._bounds = MAXIMIZED_COMMAND_BOUNDS
+        self._layout_initialized = True
 
     # ---- structured command -----------------------------------------
 
@@ -338,63 +339,60 @@ class SoftICEDriver:
         line: str,
         *,
         timeout: float = 1.5,
-        expand_window: bool = False,
     ) -> dict[str, Any]:
         """Send a command, extract its output, auto-page through ``More?``."""
-        with span("cmd_with_extract", line=line, expand=expand_window):
+        with span("cmd_with_extract", line=line):
             with span("ensure_popped"):
                 self.ensure_popped()
             with span("render.pre"):
                 pre_rows = self.ensure_open().render()
-            with self._window_context(expand_window):
-                raw = bytearray()
-                raw.extend(
-                    self._retry_once(
-                        "cmd",
-                        line,
-                        timeout=timeout,
-                        is_done=lambda: self._is_prompt_settled(require_cursor=True),
-                    )
+            raw = bytearray()
+            raw.extend(
+                self._retry_once(
+                    "cmd",
+                    line,
+                    timeout=timeout,
+                    is_done=lambda: self._is_prompt_settled(require_cursor=True),
                 )
-                command_rows: list[str] = []
-                command_rows_bold: list[bool] = []
-                parse_error: str | None = None
-                steps = 0
-                bounds = self._bounds
-                while True:
-                    with span("page_iter", step=steps) as ps:
-                        s = self.ensure_open()
-                        with span("render.loop"):
-                            rows = s.render()
-                            bold = s.render_bold()
-                        with span("detect.bounds"):
-                            bounds = detect_command_bounds(rows, self._bounds)
-                        with span("extract"):
-                            page_rows, parse_error, page_idx = extract_command_output(
-                                rows, line if steps == 0 else "", bounds, s.screen.cursor.y
-                            )
-                        ps.add(rows=len(page_rows))
-                        command_rows.extend(page_rows)
-                        command_rows_bold.extend(bold[i] for i in page_idx)
-                        with span("has_more"):
-                            more = has_more_pager(rows, bounds)
-                        if not more or steps >= MAX_PAGER_STEPS:
-                            break
-                        raw.extend(self._retry_once("send_keys", b" ") or b"")
-                        raw.extend(
-                            self._retry_once(
-                                "drain",
-                                1.0,
-                                0.2,
-                                is_done=lambda: self._is_prompt_settled(require_cursor=False),
-                            )
+            )
+            command_rows: list[str] = []
+            command_rows_bold: list[bool] = []
+            parse_error: str | None = None
+            steps = 0
+            bounds = self._bounds
+            while True:
+                with span("page_iter", step=steps) as ps:
+                    s = self.ensure_open()
+                    with span("render.loop"):
+                        rows = s.render()
+                        bold = s.render_bold()
+                    with span("detect.bounds"):
+                        bounds = detect_command_bounds(rows, self._bounds)
+                    with span("extract"):
+                        page_rows, parse_error, page_idx = extract_command_output(
+                            rows, line if steps == 0 else "", bounds, s.screen.cursor.y
                         )
-                        steps += 1
-                s = self.ensure_open()
-                raw_rows = s.render()
-                cursor = [s.screen.cursor.y, s.screen.cursor.x]
+                    ps.add(rows=len(page_rows))
+                    command_rows.extend(page_rows)
+                    command_rows_bold.extend(bold[i] for i in page_idx)
+                    with span("has_more"):
+                        more = has_more_pager(rows, bounds)
+                    if not more or steps >= MAX_PAGER_STEPS:
+                        break
+                    raw.extend(self._retry_once("send_keys", b" ") or b"")
+                    raw.extend(
+                        self._retry_once(
+                            "drain",
+                            1.0,
+                            0.2,
+                            is_done=lambda: self._is_prompt_settled(require_cursor=False),
+                        )
+                    )
+                    steps += 1
+            s = self.ensure_open()
+            raw_rows = s.render()
+            cursor = [s.screen.cursor.y, s.screen.cursor.x]
             # outside the window context: raw_rows captured inside; snapshot
-            # again for popped_in under restored bounds
             final_rows = self.ensure_open().render()
             popped_in = detect_popped_in(
                 final_rows, detect_command_bounds(final_rows, self._bounds)
@@ -413,14 +411,6 @@ class SoftICEDriver:
                 "popped_in": popped_in,
                 "pager_steps": steps,
             }
-
-    @contextlib.contextmanager
-    def _window_context(self, expand: bool) -> Iterator[None]:
-        if expand:
-            with self.expanded_command_window():
-                yield
-        else:
-            yield
 
     # ---- helpers -----------------------------------------------------
 

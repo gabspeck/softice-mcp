@@ -44,6 +44,7 @@ REMINDER_ADDR = (
     "arms in the correct process space; otherwise it will silently miss."
 )
 _EXPLICIT_SOFTICE_ERROR_SNIPPETS = (
+    "duplicate breakpoint",
     "invalid ",
     "syntax error",
     "value is too large",
@@ -135,63 +136,6 @@ def _address_linear_value(value: int | str | None) -> int | None:
         return int(rendered.split(":")[-1], 16)
     except ValueError:
         return None
-
-
-def _breakpoint_target_matches(
-    bp: dict[str, Any],
-    *,
-    kind: str,
-    address: int | str | None,
-    size: str | None,
-    verb: str | None,
-    port: int | None,
-    intno: int | None,
-) -> bool:
-    actual_kind = str(bp.get("kind") or "").upper()
-    if kind == "bpx":
-        if address is None or actual_kind != "BPX":
-            return False
-        actual_token = str(bp.get("target") or "").split()[0]
-        actual = format_address(actual_token)
-        expected = format_address(address)
-        if ":" in expected:
-            return actual == expected
-        return actual.split(":")[-1] == expected
-    if kind == "bpm":
-        if address is None or size is None or verb is None:
-            return False
-        if actual_kind != f"BPM{size.upper()}":
-            return False
-        parts = str(bp.get("target") or "").split()
-        if not parts:
-            return False
-        actual = format_address(parts[0])
-        expected = format_address(address)
-        actual_verb = parts[1].upper() if len(parts) > 1 else ""
-        if ":" in expected:
-            return actual == expected and actual_verb == verb.upper()
-        return actual.split(":")[-1] == expected and actual_verb == verb.upper()
-    if kind == "bpio":
-        if port is None or verb is None or actual_kind != "BPIO":
-            return False
-        parts = str(bp.get("target") or "").split()
-        if not parts:
-            return False
-        try:
-            actual_port = int(parts[0], 16)
-        except ValueError:
-            return False
-        actual_verb = parts[1].upper() if len(parts) > 1 else ""
-        return actual_port == port and actual_verb == verb.upper()
-    if kind == "bpint":
-        if intno is None or actual_kind != "BPINT":
-            return False
-        try:
-            actual_intno = int(str(bp.get("target") or "").split()[0], 16)
-        except (IndexError, ValueError):
-            return False
-        return actual_intno == intno
-    return False
 
 
 def _raw_envelope(
@@ -414,8 +358,7 @@ class MCPServer:
     def _tool_resume(self, args: dict[str, Any]) -> dict[str, Any]:
         address = self._optional_address(args, "address")
         line = "G" if address is None else f"G {format_address(address)}"
-        snap = self._driver.raw_cmd(line, timeout=1.0)
-        snap["line"] = line
+        snap = self._driver.resume(line)
         return _parsed_envelope(snap, parsed={"resumed": True})
 
     def _tool_wait_for_popup(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -448,11 +391,27 @@ class MCPServer:
         snap = self._driver.drain(timeout=timeout or 0.6)
         return _raw_envelope(snap)
 
+    def _clear_command_window(self, timeout: float = 1.0) -> dict[str, Any]:
+        return self._driver.cmd_with_extract("CLS", timeout=timeout)
+
+    def _typed_cmd_with_extract(self, line: str, *, timeout: float = 1.5) -> dict[str, Any]:
+        self._clear_command_window()
+        return self._driver.cmd_with_extract(line, timeout=timeout)
+
+    def _prepare_register_pane(self) -> bool:
+        self._driver.ensure_popped()
+        if self._driver.registers_visible():
+            return False
+        for _ in range(2):
+            self._driver.raw_cmd("WR", timeout=1.0)
+            if self._driver.registers_visible():
+                return True
+        raise SoftICEStateError("Register pane not visible — SoftICE may not be popped in.")
+
     def _tool_raw_cmd(self, args: dict[str, Any]) -> dict[str, Any]:
         line = self._require_string(args, "line")
         timeout = self._optional_float(args, "timeout", 1.5) or 1.5
-        expand_window = bool(args.get("expand_window", False))
-        snap = self._driver.cmd_with_extract(line, timeout=timeout, expand_window=expand_window)
+        snap = self._driver.cmd_with_extract(line, timeout=timeout)
         return _raw_envelope(snap, parse_error=snap.get("parse_error"))
 
     def _tool_send_keys(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -474,43 +433,45 @@ class MCPServer:
         count = self._optional_int(args, "count", default=1) or 1
         if count < 1:
             raise ValueError("count must be >= 1")
-        last_snap: dict[str, Any] | None = None
-        for _ in range(count):
-            last_snap = self._driver.cmd_with_extract(cmd, timeout=1.5, expand_window=False)
-        assert last_snap is not None
-        with span("parse.parse_register_dump", rows=len(last_snap["raw_rows"])):
-            reg = parse_register_dump(last_snap["raw_rows"])
-        return _parsed_envelope(
-            last_snap,
-            parsed={"label": label, "count": count, "registers": reg["parsed"]},
-            parse_error=last_snap.get("parse_error") or reg["parse_error"],
-        )
+        cleanup_registers = self._prepare_register_pane()
+        try:
+            last_snap: dict[str, Any] | None = None
+            for _ in range(count):
+                last_snap = self._typed_cmd_with_extract(cmd, timeout=1.5)
+            assert last_snap is not None
+            with span("parse.parse_register_dump", rows=len(last_snap["raw_rows"])):
+                reg = parse_register_dump(last_snap["raw_rows"])
+            return _parsed_envelope(
+                last_snap,
+                parsed={"label": label, "count": count, "registers": reg["parsed"]},
+                parse_error=last_snap.get("parse_error") or reg["parse_error"],
+            )
+        finally:
+            if cleanup_registers:
+                self._driver.raw_cmd("WR", timeout=1.0)
 
     def _tool_go_until(self, args: dict[str, Any]) -> dict[str, Any]:
         address = self._require_address(args, "address")
         line = f"G {format_address(address)}"
-        snap = self._driver.cmd_with_extract(line, timeout=5.0, expand_window=False)
+        snap = self._typed_cmd_with_extract(line, timeout=5.0)
         return _parsed_envelope(snap, parsed={"issued": line})
 
     # ---- inspection ---------------------------------------------
 
     def _tool_registers(self, args: dict[str, Any]) -> dict[str, Any]:
-        self._driver.ensure_popped()
-        snap = self._driver.drain(timeout=0.3)
-        with span("parse.parse_register_dump", rows=len(snap["raw_rows"])):
-            parsed = parse_register_dump(snap["raw_rows"])
-        if parsed["parsed"]:
-            return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
-        # `WR` toggles the register window. Try up to twice: one toggle
-        # handles a hidden pane; two handles a pane that was on but only
-        # partially painted (first WR hides it, second forces a fresh paint).
-        for _ in range(2):
-            snap = self._driver.raw_cmd("WR", timeout=1.0)
+        cleanup_registers = self._prepare_register_pane()
+        try:
+            snap = self._clear_command_window()
+            snap = dict(snap)
+            snap["line"] = None
             with span("parse.parse_register_dump", rows=len(snap["raw_rows"])):
                 parsed = parse_register_dump(snap["raw_rows"])
-            if parsed["parsed"]:
-                return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
-        raise SoftICEStateError("Register pane not visible — SoftICE may not be popped in.")
+            if not parsed["parsed"]:
+                raise SoftICEStateError("Register pane not visible — SoftICE may not be popped in.")
+            return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
+        finally:
+            if cleanup_registers:
+                self._driver.raw_cmd("WR", timeout=1.0)
 
     def _tool_read_memory(self, args: dict[str, Any]) -> dict[str, Any]:
         address = self._require_address(args, "address")
@@ -521,7 +482,7 @@ class MCPServer:
         if width not in ("b", "w", "d"):
             raise ValueError("width must be b|w|d")
         line = f"D{width.upper()} {format_address(address)} L{length:X}"
-        snap = self._driver.cmd_with_extract(line, timeout=2.5, expand_window=True)
+        snap = self._typed_cmd_with_extract(line, timeout=2.5)
         with span("parse.parse_memory_dump", rows=len(snap["command_rows"])):
             parsed = parse_memory_dump(snap["command_rows"])
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
@@ -535,7 +496,7 @@ class MCPServer:
         # instructions are at most 15 bytes; ask for `count * 16` bytes so
         # we're guaranteed at least `count` instructions, then truncate.
         line = f"U {format_address(address)} L{count * 16:X}"
-        snap = self._driver.cmd_with_extract(line, timeout=2.0, expand_window=True)
+        snap = self._typed_cmd_with_extract(line, timeout=2.0)
         with span("parse.parse_disasm", rows=len(snap["command_rows"])):
             parsed = parse_disasm(snap["command_rows"])
         if parsed["parsed"]:
@@ -546,13 +507,13 @@ class MCPServer:
         expr = self._require_string(args, "expr")
         if "\n" in expr or "\r" in expr:
             raise ValueError("expr must not contain newlines")
-        snap = self._driver.cmd_with_extract(f"? {expr}", timeout=1.5, expand_window=False)
+        snap = self._typed_cmd_with_extract(f"? {expr}", timeout=1.5)
         with span("parse.parse_eval_result", rows=len(snap["command_rows"])):
             parsed = parse_eval_result(snap["command_rows"])
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
     def _read_addr_contexts(self, *, timeout: float = 2.0) -> tuple[dict[str, Any], dict[str, Any]]:
-        snap = self._driver.cmd_with_extract("ADDR", timeout=timeout, expand_window=False)
+        snap = self._typed_cmd_with_extract("ADDR", timeout=timeout)
         with span("parse.parse_addr_table", rows=len(snap["command_rows"])):
             parsed = parse_addr_table(
                 snap["command_rows"], snap.get("command_rows_bold")
@@ -563,9 +524,7 @@ class MCPServer:
         name = args.get("name")
         if name:
             target = str(name).strip()
-            snap = self._driver.cmd_with_extract(
-                f"ADDR {target}", timeout=2.0, expand_window=False
-            )
+            snap = self._typed_cmd_with_extract(f"ADDR {target}", timeout=2.0)
             verify_snap, parsed = self._read_addr_contexts(timeout=2.0)
             if parsed["parsed"] and _active_context_matches(parsed["parsed"], target):
                 current = parsed["parsed"].get("current") or target
@@ -590,7 +549,7 @@ class MCPServer:
     def _tool_module_info(self, args: dict[str, Any]) -> dict[str, Any]:
         pattern = args.get("pattern")
         line = "MOD" if not pattern else f"MOD {str(pattern).strip()}"
-        snap = self._driver.cmd_with_extract(line, timeout=3.0, expand_window=True)
+        snap = self._typed_cmd_with_extract(line, timeout=3.0)
         with span("parse.parse_mod_table", rows=len(snap["command_rows"])):
             parsed = parse_mod_table(snap["command_rows"])
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
@@ -620,7 +579,6 @@ class MCPServer:
         )
         context = args.get("context")
         addr_line: str | None = compose_addr_switch(context) if context else None
-        return_breakpoints = bool(args.get("return_breakpoints", False))
 
         note: str | None = None
         linear_address = _address_linear_value(address)
@@ -631,9 +589,7 @@ class MCPServer:
         # SoftICE 3.x rejects `ADDR x; BPX y` compound with Invalid Context
         # Handle — switch has to commit before BPX runs. Issue as two commands.
         if addr_line is not None:
-            addr_snap = self._driver.cmd_with_extract(
-                addr_line, timeout=2.0, expand_window=False
-            )
+            addr_snap = self._typed_cmd_with_extract(addr_line, timeout=2.0)
             addr_msg = _command_error_message(addr_snap["command_rows"])
             if addr_msg:
                 return _parsed_envelope(
@@ -643,52 +599,11 @@ class MCPServer:
                     note=addr_msg,
                 )
 
-        snap = self._driver.cmd_with_extract(
-            bp_line, timeout=2.0, expand_window=False
-        )
+        snap = self._typed_cmd_with_extract(bp_line, timeout=2.0)
         bp_msg = _command_error_message(snap["command_rows"])
         issued = [addr_line, bp_line] if addr_line else [bp_line]
-        must_verify_breakpoint = kind in ("bpio", "bpint") or (
-            kind in ("bpx", "bpm") and linear_address is not None
-        )
-        fetch_breakpoints = return_breakpoints or must_verify_breakpoint
 
         parsed: dict[str, Any] = {"issued": issued}
-        if fetch_breakpoints:
-            follow = self._driver.cmd_with_extract(
-                "BL", timeout=1.5, expand_window=False
-            )
-            with span(
-                "parse.parse_breakpoint_list",
-                rows=len(follow["command_rows"]),
-            ):
-                parsed_bl = parse_breakpoint_list(follow["command_rows"])
-            bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
-            if return_breakpoints:
-                parsed["breakpoints"] = bps
-            if must_verify_breakpoint:
-                if any(
-                    _breakpoint_target_matches(
-                        bp,
-                        kind=kind,
-                        address=address,
-                        size=args.get("size"),
-                        verb=args.get("verb"),
-                        port=args.get("port"),
-                        intno=args.get("intno"),
-                    )
-                    for bp in bps
-                ):
-                    return _parsed_envelope(snap, parsed=parsed, note=note)
-                missing_note = bp_msg or _command_output_message(snap["command_rows"])
-                if not missing_note:
-                    missing_note = "Breakpoint did not appear in `BL` after set."
-                return _parsed_envelope(
-                    follow,
-                    parsed=parsed,
-                    parse_error="bpx_rejected",
-                    note=missing_note,
-                )
         if bp_msg:
             return _parsed_envelope(
                 snap,
@@ -699,7 +614,7 @@ class MCPServer:
         return _parsed_envelope(snap, parsed=parsed, note=note)
 
     def _tool_bp_list(self, args: dict[str, Any]) -> dict[str, Any]:
-        snap = self._driver.cmd_with_extract("BL", timeout=1.5, expand_window=True)
+        snap = self._typed_cmd_with_extract("BL", timeout=1.5)
         with span("parse.parse_breakpoint_list", rows=len(snap["command_rows"])):
             parsed = parse_breakpoint_list(snap["command_rows"])
         bps = parsed["parsed"]["breakpoints"] if parsed["parsed"] else []
@@ -722,12 +637,10 @@ class MCPServer:
             index = self._require_int(args, "index")
         return_breakpoints = bool(args.get("return_breakpoints", False))
         line = compose_bp_mutate(op, index)
-        snap = self._driver.cmd_with_extract(line, timeout=1.5, expand_window=False)
+        snap = self._typed_cmd_with_extract(line, timeout=1.5)
         parsed: dict[str, Any] = {"issued": line}
         if return_breakpoints:
-            follow = self._driver.cmd_with_extract(
-                "BL", timeout=1.5, expand_window=True
-            )
+            follow = self._typed_cmd_with_extract("BL", timeout=1.5)
             with span("parse.parse_breakpoint_list", rows=len(follow["command_rows"])):
                 parsed_bl = parse_breakpoint_list(follow["command_rows"])
             bps = parsed_bl["parsed"]["breakpoints"] if parsed_bl["parsed"] else []
@@ -960,10 +873,6 @@ class MCPServer:
                 {
                     "line": {"type": "string"},
                     "timeout": {"type": "number"},
-                    "expand_window": {
-                        "type": "boolean",
-                        "description": "Hide the Code/Data panes so long output fits in one screen (restored after).",
-                    },
                 },
                 ["line"],
             ),
@@ -1000,13 +909,13 @@ class MCPServer:
             ),
             self._tool(
                 "registers",
-                "Return the Register pane parsed as a dict (eax, ebx, …, flags_set). Reads the already-painted pane — does NOT send `R`, which would drop SoftICE into interactive flag-edit mode. Requires SoftICE to be popped in.",
+                "Return the Register pane parsed as a dict (eax, ebx, …, flags_set). Temporarily shows the Register pane with `WR` when needed, clears the command window, parses the pane, then restores the maximized-command layout.",
                 {},
                 [],
             ),
             self._tool(
                 "read_memory",
-                "Dump up to 4096 bytes via D/DB/DW/DD. Runs in an expanded Command window so there's no pager. Returns hex, ASCII, and a per-line breakdown.",
+                "Dump up to 4096 bytes via D/DB/DW/DD. Clears the command window first, then returns hex, ASCII, and a per-line breakdown.",
                 {
                     "address": addr_schema,
                     "length": {"type": "integer", "default": 128},
@@ -1044,8 +953,6 @@ class MCPServer:
             self._tool(
                 "bp_set",
                 "Arm a breakpoint. Composes BPX/BPM[size]/BPIO/BPINT with optional IF/DO. "
-                "By default returns only the issued command line; set "
-                "`return_breakpoints=true` to also run BL and include the parsed list. "
                 + REMINDER_ADDR
                 + " " + REMINDER_RESUME,
                 {
@@ -1067,11 +974,6 @@ class MCPServer:
                     "context": {
                         "type": "string",
                         "description": "Optional process name to prefix as `ADDR <ctx>;`. Required when the address is in 0x00400000..0x7FFFFFFF and loaded in a specific process.",
-                    },
-                    "return_breakpoints": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "When true, run BL after the BP and include `breakpoints` in the response. Default false (saves a round-trip).",
                     },
                 },
                 ["kind"],
@@ -1112,12 +1014,13 @@ def _run_self_test(path: str) -> int:
     steps: list[tuple[str, dict[str, Any]]] = []
     try:
         driver.connect(path)
-        driver.default_layout()
         steps.append(("popup", driver.popup()))
         steps.append(("eval 1+1", driver.cmd_with_extract("? 1+1")))
+        driver.raw_cmd("WR")
         steps.append(("registers", driver.drain(timeout=0.3)))
-        steps.append(("bl", driver.cmd_with_extract("BL", expand_window=True)))
-        steps.append(("resume", driver.raw_cmd("G")))
+        driver.raw_cmd("WR")
+        steps.append(("bl", driver.cmd_with_extract("BL")))
+        steps.append(("resume", driver.resume("G")))
     except Exception as exc:
         print(f"self-test FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

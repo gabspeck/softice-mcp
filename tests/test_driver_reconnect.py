@@ -78,6 +78,22 @@ class FakeSoftICE:
             return FakeSoftICE.render_sequence.pop(0)
         return [" " * 80 for _ in range(25)]
 
+    def clear_render_state(self) -> None:
+        self.screen = FakeScreen()
+
+
+def _blank_rows() -> list[str]:
+    return [" " * 80 for _ in range(25)]
+
+
+def _popped_rows(*, registers: bool) -> list[str]:
+    rows = _blank_rows()
+    if registers:
+        rows[0] = "EAX=00000001 EBX=00000002".ljust(80)
+        rows[3] = ("-" * 73 + "PROT32-").ljust(80)
+    rows[24] = ":".ljust(80)
+    return rows
+
 
 @pytest.fixture
 def fake_softice(monkeypatch):
@@ -228,6 +244,22 @@ class TestSendKeys:
         assert drv._popped_in is None
 
 
+class TestResume:
+    def test_resume_clears_render_state_and_marks_detached(self, fake_softice):
+        drv = SoftICEDriver()
+        drv.connect("/tmp/softice")
+        fake_softice.render_sequence = [_popped_rows(registers=False)]
+
+        result = drv.resume("G 7E893010")
+
+        inst = fake_softice.instances[0]
+        assert inst.send_calls == [b"\rG 7E893010\r"]
+        assert drv._popped_in is False
+        assert result["popped_in"] is False
+        assert result["line"] == "G 7E893010"
+        assert drv.ensure_open().render() == [" " * 80 for _ in range(25)]
+
+
 class TestWaitForPopup:
     def test_returns_immediately_when_cached_popped(self, fake_softice):
         drv = SoftICEDriver()
@@ -295,32 +327,49 @@ class TestWaitForPopup:
             drv.wait_for_popup(timeout_ms=timeout_ms, poll_interval_ms=poll_interval_ms)
 
 
-class TestExpandedWindow:
-    def test_context_manager_restores_bounds(self, fake_softice):
+class TestSessionLayout:
+    def test_ensure_popped_initializes_layout_once(self, fake_softice):
         drv = SoftICEDriver()
         drv.connect("/tmp/softice")
-        assert drv.bounds == (17, 24)
-        with drv.expanded_command_window():
-            assert drv.bounds == (4, 24)
-        assert drv.bounds == (17, 24)
+        fake_softice.render_sequence = [
+            _popped_rows(registers=True),
+            _popped_rows(registers=True),
+            _popped_rows(registers=False),
+        ]
 
-    def test_context_manager_issues_wc_wd(self, fake_softice):
-        drv = SoftICEDriver()
-        drv.connect("/tmp/softice")
-        with drv.expanded_command_window():
-            pass
-        calls = fake_softice.instances[0].cmd_calls
-        assert "WC" in calls
-        assert "WD" in calls
-        # restore issued too
-        assert any(c.startswith("WC ") for c in calls)
-        assert any(c.startswith("WD ") for c in calls)
+        first_sent_popup = drv.ensure_popped()
+        second_sent_popup = drv.ensure_popped()
 
-    def test_restores_on_exception(self, fake_softice):
+        assert first_sent_popup is False
+        assert second_sent_popup is False
+        assert drv.bounds == (0, 24)
+        assert fake_softice.instances[0].cmd_calls == ["WR"]
+
+    def test_popup_initializes_layout_after_ctrl_d(self, fake_softice):
         drv = SoftICEDriver()
         drv.connect("/tmp/softice")
-        with pytest.raises(RuntimeError):
-            with drv.expanded_command_window():
-                assert drv.bounds == (4, 24)
-                raise RuntimeError("boom")
-        assert drv.bounds == (17, 24)
+        fake_softice.render_sequence = [
+            _blank_rows(),
+            _popped_rows(registers=True),
+            _popped_rows(registers=False),
+        ]
+
+        result = drv.popup(timeout=0.1)
+
+        assert result["popped_in"] is True
+        assert drv.bounds == (0, 24)
+        assert fake_softice.instances[0].cmd_calls == ["WR"]
+
+    def test_ensure_popped_leaves_hidden_registers_alone(self, fake_softice):
+        drv = SoftICEDriver()
+        drv.connect("/tmp/softice")
+        fake_softice.render_sequence = [
+            _popped_rows(registers=False),
+            _popped_rows(registers=False),
+        ]
+
+        sent_popup = drv.ensure_popped()
+
+        assert sent_popup is False
+        assert drv.bounds == (0, 24)
+        assert fake_softice.instances[0].cmd_calls == []
