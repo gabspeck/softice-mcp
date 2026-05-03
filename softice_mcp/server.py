@@ -102,30 +102,6 @@ def _command_error_message(command_rows: list[str]) -> str:
     return ""
 
 
-def _context_matches_target(context: dict[str, Any], target: str) -> bool:
-    owner = str(context.get("owner") or "")
-    if owner and owner.casefold() == target.casefold():
-        return True
-    try:
-        handle = int(target, 16)
-    except ValueError:
-        return False
-    return context.get("handle") == handle
-
-
-def _active_context_matches(parsed: dict[str, Any], target: str) -> bool:
-    contexts = parsed.get("contexts") or []
-    active = [ctx for ctx in contexts if ctx.get("active")]
-    if active:
-        return any(_context_matches_target(ctx, target) for ctx in active)
-    current = parsed.get("current")
-    if isinstance(current, str) and current.casefold() == target.casefold():
-        return True
-    if contexts:
-        return _context_matches_target(contexts[0], target)
-    return False
-
-
 def _address_linear_value(value: int | str | None) -> int | None:
     if value is None or isinstance(value, bool):
         return None
@@ -531,24 +507,15 @@ class MCPServer:
         if name:
             target = str(name).strip()
             snap = self._typed_cmd_with_extract(f"ADDR {target}", timeout=2.0)
-            verify_snap, parsed = self._read_addr_contexts(timeout=2.0)
-            if parsed["parsed"] and _active_context_matches(parsed["parsed"], target):
-                current = parsed["parsed"].get("current") or target
+            message = _command_output_message(snap["command_rows"])
+            if message:
                 return _parsed_envelope(
-                    verify_snap,
-                    parsed={"switched_to": current},
+                    snap,
+                    parsed={"attempted": target},
+                    parse_error="switch_failed",
+                    note=message,
                 )
-            message = (
-                _command_error_message(snap["command_rows"])
-                or _command_output_message(snap["command_rows"])
-                or parsed["parse_error"]
-            )
-            return _parsed_envelope(
-                verify_snap,
-                parsed={"attempted": target},
-                parse_error="switch_failed",
-                note=message,
-            )
+            return _parsed_envelope(snap, parsed={"switched_to": target})
         snap, parsed = self._read_addr_contexts(timeout=2.0)
         return _parsed_envelope(snap, parsed=parsed["parsed"], parse_error=parsed["parse_error"])
 
@@ -818,11 +785,11 @@ class MCPServer:
         return [
             self._tool(
                 "connect",
-                "Open the SoftICE serial transport. Call this once before any other tool — subsequent commands reuse the connection and auto-pop SoftICE (Ctrl-D) when needed. Use the 86Box Named Pipe / UNIX FIFO base path (typically `/tmp/softice`, which maps to `/tmp/softice.in` and `/tmp/softice.out`). Passing either endpoint file also works; the server normalizes it back to the same base path. The transport is locked to one MCP process at a time. Calling `connect` again replaces the existing connection.",
+                "Open the SoftICE serial transport. Call this once before any other tool — subsequent commands reuse the connection and auto-pop SoftICE (Ctrl-D) when needed. Use the host-side path of the PTY exposed by 86Box's Virtual Console backend (typically `/tmp/softice_host`, or whatever path 86Box's COM1 config points at). The transport is locked to one MCP process at a time. Calling `connect` again replaces the existing connection.",
                 {
                     "path": {
                         "type": "string",
-                        "description": "Filesystem path to the 86Box FIFO base (e.g. /tmp/softice) or one endpoint file such as /tmp/softice.in.",
+                        "description": "Filesystem path to the SoftICE PTY device exposed by 86Box (e.g. /tmp/softice_host, or a /dev/pts/N device).",
                     },
                     "profile_log": {
                         "type": "string",
@@ -1013,8 +980,8 @@ def _run_self_test(path: str) -> int:
     """Smoke-test driver + parsers against a live SoftICE session.
 
     Requires a VM where SoftICE is configured for VT100-over-serial and 86Box
-    exposes a Named Pipe / UNIX FIFO base path. Prints a short summary and
-    exits 0 on success, non-zero on the first failure.
+    exposes the host side of a PTY pair via Virtual Console. Prints a short
+    summary and exits 0 on success, non-zero on the first failure.
     """
     driver = SoftICEDriver()
     steps: list[tuple[str, dict[str, Any]]] = []
@@ -1046,8 +1013,8 @@ def main() -> int:
         "--self-test",
         metavar="PATH",
         default=None,
-        help="Run a live smoke test against the given transport path and exit "
-        "(typically /tmp/softice). In normal serve mode the path is supplied "
+        help="Run a live smoke test against the given PTY device path and exit "
+        "(typically /tmp/softice_host). In normal serve mode the path is supplied "
         "by the MCP client via the `connect` tool.",
     )
     ns = parser.parse_args()

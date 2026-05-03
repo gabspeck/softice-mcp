@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "softice-mcp"
 version = "0.1.0"
-description = "MCP server bridge for SoftICE over an 86Box VT100 serial FIFO transport"
+description = "MCP server bridge for SoftICE over a UNIX PTY (86Box Virtual Console)"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Gabriel Speckhahn" }]

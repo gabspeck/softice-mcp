@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Drive SoftICE 3.2 running in VT100-over-serial mode over 86Box Named Pipe /
-UNIX FIFO character devices.
+Drive SoftICE 3.2 running in VT100-over-serial mode over a UNIX PTY device
+exposed by 86Box's Virtual Console backend.
 
 Preferred layout: inside the Win95 VM SoftICE is configured with
     SERIAL ON 1 115200    ; plus DISPLAY VT100
-and 86Box's COM1 backend is set to Named Pipe / UNIX FIFO in Server mode with
-path /tmp/softice. That yields:
-    /tmp/softice.in       host -> guest writes
-    /tmp/softice.out      guest -> host reads
+86Box's COM1 backend is set to ``Virtual Console``. 86Box allocates the PTY
+pair itself and exposes the host side at the configured path (e.g.
+``/tmp/softice_host``). This module opens that path as a single non-blocking,
+raw-mode, 8N1 / 115200 PTY fd.
 
-This module speaks the raw VT100 stream SoftICE emits, feeds it into a
-pyte-backed 80x25 virtual screen, and exposes:
+Public API:
 
     SoftICE.open() / .close()
     SoftICE.popup()                  -- Ctrl-D to break into SoftICE
@@ -22,11 +21,11 @@ pyte-backed 80x25 virtual screen, and exposes:
     SoftICE.render()                 -- list[str] of the 25 rendered rows
 
 CLI:
-    softice.py popup                 Ctrl-D, dump screen
-    softice.py cmd "d 400000"        run a command, dump screen
-    softice.py keys "G\\r"           raw keystrokes (shell-quoted, \\r / \\e OK)
-    softice.py screen                just dump what's currently painted
-    softice.py reset                 try to exit any help pager and clear
+    softice.py --path /tmp/softice_host popup
+    softice.py --path /tmp/softice_host cmd "d 400000"
+    softice.py --path /tmp/softice_host keys "G\\r"
+    softice.py --path /tmp/softice_host screen
+    softice.py --path /tmp/softice_host reset
 """
 
 from __future__ import annotations
@@ -35,8 +34,11 @@ import argparse
 import errno
 import os
 import select
+import stat as stat_mod
 import sys
+import termios
 import time
+import tty
 from collections.abc import Callable
 
 import pyte
@@ -48,50 +50,30 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
 
-HOST_PATH = "/tmp/softice"
 WRITE_TIMEOUT = 1.0
-INTER_BYTE_DELAY = 0.01
-PIPE_OPEN_TIMEOUT = 3.0
-PIPE_OPEN_RETRY_DELAY = 0.05
+BAUD = termios.B115200
 
 
 class SoftICEBusyError(RuntimeError):
-    """Another process already owns the SoftICE FIFO transport."""
+    """Another process already owns the SoftICE PTY transport."""
 
 
-def _char_pipe_base(path: str) -> str:
-    if path.endswith(".in"):
-        return path[:-3]
-    if path.endswith(".out"):
-        return path[:-4]
-    return path
+class NotATTYError(RuntimeError):
+    """Configured transport path is not a character device (PTY)."""
 
 
 class SoftICE:
-    def __init__(self, path: str = HOST_PATH, rows: int = 25, cols: int = 80):
+    def __init__(self, path: str, rows: int = 25, cols: int = 80):
         self.path = path
-        self.fd_in: int | None = None
-        self.fd_out: int | None = None
+        self.fd: int | None = None
         self._lock_fd: int | None = None
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
 
-    @property
-    def fd(self) -> int | None:
-        return self.fd_out
-
-    @fd.setter
-    def fd(self, value: int | None) -> None:
-        self.fd_in = value
-        self.fd_out = value
-
-    def _lock_target(self) -> str:
-        return _char_pipe_base(self.path)
-
     def _acquire_lock(self) -> None:
         if self._lock_fd is not None or fcntl is None:
             return
-        lock_path = f"{self._lock_target()}.lock"
+        lock_path = f"{self.path}.lock"
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -99,7 +81,7 @@ class SoftICE:
             os.close(fd)
             if exc.errno in (errno.EACCES, errno.EAGAIN):
                 raise SoftICEBusyError(
-                    f"SoftICE transport is already in use: {self._lock_target()}"
+                    f"SoftICE transport is already in use: {self.path}"
                 ) from exc
             raise
         self._lock_fd = fd
@@ -112,69 +94,53 @@ class SoftICE:
         os.close(self._lock_fd)
         self._lock_fd = None
 
-    def _open_fifo_read(self, path: str, deadline: float) -> int:
-        while True:
-            try:
-                return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            except OSError as exc:
-                if exc.errno not in (errno.ENOENT,):
-                    raise
-                if time.monotonic() >= deadline:
-                    raise FileNotFoundError(
-                        f"SoftICE read endpoint not available: {path}"
-                    ) from exc
-                time.sleep(PIPE_OPEN_RETRY_DELAY)
+    def _configure_termios(self, fd: int) -> None:
+        # Raw mode first — disables canonical processing, echo, signal
+        # generation, and the assorted \r/\n translations that would otherwise
+        # eat SoftICE's VT100 stream.
+        tty.setraw(fd, termios.TCSANOW)
+        # Re-fetch and force 8N1 + 115200 + no flow control. The PTY may
+        # inherit IXON/CRTSCTS from whoever opened the slave, which would
+        # silently throttle SoftICE's output mid-frame.
+        iflag, oflag, cflag, lflag, _ispeed, _ospeed, cc = termios.tcgetattr(fd)
+        cflag &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB | termios.CRTSCTS)
+        cflag |= termios.CS8 | termios.CLOCAL | termios.CREAD
+        iflag &= ~(termios.IXON | termios.IXOFF | termios.IXANY)
+        termios.tcsetattr(
+            fd,
+            termios.TCSANOW,
+            [iflag, oflag, cflag, lflag, BAUD, BAUD, cc],
+        )
+        termios.tcflush(fd, termios.TCIOFLUSH)
 
-    def _open_fifo_write(self, path: str, deadline: float) -> int:
-        while True:
-            try:
-                return os.open(path, os.O_WRONLY | os.O_NONBLOCK)
-            except OSError as exc:
-                if exc.errno not in (
-                    errno.ENOENT,
-                    errno.ENXIO,
-                    errno.EAGAIN,
-                    errno.EWOULDBLOCK,
-                ):
-                    raise
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"SoftICE write endpoint did not become ready: {path}"
-                    ) from exc
-                time.sleep(PIPE_OPEN_RETRY_DELAY)
-
-    def _open_char_pipe(self) -> None:
-        base = _char_pipe_base(self.path)
-        deadline = time.monotonic() + PIPE_OPEN_TIMEOUT
-        self.fd_in = self._open_fifo_read(f"{base}.out", deadline)
+    def _open_pty(self) -> int:
+        st = os.stat(self.path)
+        if not stat_mod.S_ISCHR(st.st_mode):
+            raise NotATTYError(
+                f"SoftICE transport path is not a character device: {self.path}"
+            )
+        fd = os.open(self.path, os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY)
         try:
-            self.fd_out = self._open_fifo_write(f"{base}.in", deadline)
+            self._configure_termios(fd)
         except Exception:
-            assert self.fd_in is not None
-            os.close(self.fd_in)
-            self.fd_in = None
+            os.close(fd)
             raise
+        return fd
 
     def open(self) -> None:
-        if self.fd_in is not None and self.fd_out is not None:
+        if self.fd is not None:
             return
         self._acquire_lock()
         try:
-            self._open_char_pipe()
+            self.fd = self._open_pty()
         except Exception:
             self.close()
             raise
 
     def close(self) -> None:
-        fds: list[int] = []
-        if self.fd_in is not None:
-            fds.append(self.fd_in)
-        if self.fd_out is not None and self.fd_out != self.fd_in:
-            fds.append(self.fd_out)
-        for fd in fds:
-            os.close(fd)
-        self.fd_in = None
-        self.fd_out = None
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
         self._release_lock()
 
     def __enter__(self):
@@ -197,37 +163,41 @@ class SoftICE:
         fed into the pyte stream (i.e. only when fresh bytes actually arrived
         — the no-data path stays cheap). Returning ``True`` exits the loop
         immediately with whatever has been read so far.
+
+        A zero-byte read after select reports the fd readable means the PTY
+        peer hung up; raise EIO so the driver's reconnect path triggers.
         """
-        assert self.fd_in is not None
+        assert self.fd is not None
         with span("drain.io") as s:
             data = bytearray()
             end = time.monotonic() + timeout
             while time.monotonic() < end:
-                r, _, _ = select.select([self.fd_in], [], [], 0.1)
+                r, _, _ = select.select([self.fd], [], [], 0.1)
                 if r:
                     try:
-                        chunk = os.read(self.fd_in, 65536)
+                        chunk = os.read(self.fd, 65536)
                     except BlockingIOError:
                         continue
                     except OSError as exc:
                         if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                             continue
                         raise
-                    if chunk:
-                        data.extend(chunk)
-                        end = time.monotonic() + settle
-                        # Feed incrementally so the rendered grid reflects the
-                        # latest bytes when ``is_done`` runs. pyte handles
-                        # partial feeds correctly.
-                        self.stream.feed(chunk.decode("latin-1"))
-                        if is_done is not None and is_done():
-                            break
+                    if not chunk:
+                        raise OSError(errno.EIO, "PTY peer closed")
+                    data.extend(chunk)
+                    end = time.monotonic() + settle
+                    # Feed incrementally so the rendered grid reflects the
+                    # latest bytes when ``is_done`` runs. pyte handles
+                    # partial feeds correctly.
+                    self.stream.feed(chunk.decode("latin-1"))
+                    if is_done is not None and is_done():
+                        break
             s.add(bytes=len(data))
             return bytes(data)
 
     def _write_all(self, data: bytes, timeout: float = WRITE_TIMEOUT) -> None:
         """Write the full buffer to the nonblocking transport or raise on timeout."""
-        assert self.fd_out is not None
+        assert self.fd is not None
         if not data:
             return
 
@@ -240,7 +210,7 @@ class SoftICE:
                     "SoftICE transport did not become writable before the write timeout expired"
                 )
             try:
-                _, writable, _ = select.select([], [self.fd_out], [], remaining)
+                _, writable, _ = select.select([], [self.fd], [], remaining)
             except InterruptedError:
                 continue
             if not writable:
@@ -248,7 +218,7 @@ class SoftICE:
                     "SoftICE transport did not become writable before the write timeout expired"
                 )
             try:
-                written = os.write(self.fd_out, view)
+                written = os.write(self.fd, view)
             except BlockingIOError:
                 continue
             except OSError as exc:
@@ -259,22 +229,13 @@ class SoftICE:
                 continue
             view = view[written:]
 
-    def _send_paced(self, data: bytes) -> None:
-        # 86Box now drains host bytes before checking guest RX capacity, so a
-        # bursty host write can drop characters inside the guest UART path.
-        # We intentionally trade throughput for deterministic delivery here.
-        with span("send_paced", n=len(data)):
-            for i, byte in enumerate(data):
-                self._write_all(bytes((byte,)))
-                if i + 1 < len(data):
-                    time.sleep(INTER_BYTE_DELAY)
-
     def send_keys(self, s: str | bytes) -> None:
         """Write raw bytes, no terminator added."""
-        assert self.fd_out is not None
+        assert self.fd is not None
         if isinstance(s, str):
             s = s.encode("latin-1")
-        self._send_paced(s)
+        with span("send_keys", n=len(s)):
+            self._write_all(s)
 
     def cmd(
         self,
@@ -365,6 +326,11 @@ def _format_screen(rows: list[str]) -> str:
 
 def _main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--path",
+        required=True,
+        help="PTY device path (e.g. /tmp/softice_host or /dev/pts/12)",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("popup", help="Ctrl-D into SoftICE, then dump screen")
@@ -380,7 +346,7 @@ def _main(argv: list[str]) -> int:
 
     args = ap.parse_args(argv)
 
-    with SoftICE() as s:
+    with SoftICE(args.path) as s:
         if args.cmd == "popup":
             s.popup()
         elif args.cmd == "cmd":

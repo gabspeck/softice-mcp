@@ -46,7 +46,7 @@ def test_raw_cmd_does_not_prepend_cls(monkeypatch):
     assert result["ok"] is True
 
 
-def test_addr_context_switch_verifies_via_addr_listing(monkeypatch):
+def test_addr_context_succeeds_when_switch_command_is_silent(monkeypatch):
     server = MCPServer()
     calls: list[str] = []
 
@@ -55,47 +55,39 @@ def test_addr_context_switch_verifies_via_addr_listing(monkeypatch):
         if line == "CLS":
             return _snap()
         if line == "ADDR Mosview":
-            return _snap(
-                command_rows=[
-                    "WINICE: Load32 KERNEL32",
-                    "WINICE: LogError ERR_00",
-                    "Windows is active, press CTRL Z to pop up WINICE",
-                ]
-            )
-        if line == "ADDR":
-            return _snap(
-                command_rows=[
-                    "Handle    PGTPTR    Tables  Min Addr  Max Addr  Mutex     Owner",
-                    "CB1148A0  CB115040  01FC    00400000  7FFFF000  CB1148D4  Starter",
-                    "CB113214  CB113FE8  01FC    00400000  7FFFF000  CB113248  Systray",
-                    "CB111654  CB11166C  0002    00400000  7FFFF000  CB112048  MMTASK",
-                    "CB1100CC  CB11051C  0200    00400000  7FFFF000  CB110100  Mprexe",
-                    "C10D900C  C10D9024  0002    00400000  7FFFF000  C10D9050",
-                ],
-                raw_rows=[
-                    "                                                F10",
-                    " ADDR Mosview",
-                    "",
-                    " ADDR",
-                    "Handle    PGTPTR    Tables  Min Addr  Max Addr  Mutex     Owner",
-                    "CB1148A0  CB115040  01FC    00400000  7FFFF000  CB1148D4  Starter",
-                    "CB113214  CB113FE8  01FC    00400000  7FFFF000  CB113248  Systray",
-                    "CB111654  CB11166C  0002    00400000  7FFFF000  CB112048  MMTASK",
-                    "CB1100CC  CB11051C  0200    00400000  7FFFF000  CB110100  Mprexe",
-                    "C10D900C  C10D9024  0002    00400000  7FFFF000  C10D9050",
-                    "",
-                    "     Enter a command (H for help)                                       Mosview",
-                ],
-            )
+            return _snap(command_rows=[])
         raise AssertionError(line)
 
     monkeypatch.setattr(server._driver, "cmd_with_extract", fake_cmd_with_extract)
 
     result = server._call_tool("addr_context", {"name": "Mosview"})
 
-    assert calls == ["CLS", "ADDR Mosview", "CLS", "ADDR"]
+    assert calls == ["CLS", "ADDR Mosview"]
     assert result["ok"] is True
     assert result["parsed"] == {"switched_to": "Mosview"}
+
+
+def test_addr_context_fails_when_switch_command_prints_output(monkeypatch):
+    server = MCPServer()
+    calls: list[str] = []
+
+    def fake_cmd_with_extract(line: str, *, timeout: float = 0.0):
+        calls.append(line)
+        if line == "CLS":
+            return _snap()
+        if line == "ADDR mosview":
+            return _snap(command_rows=["Invalid command"])
+        raise AssertionError(line)
+
+    monkeypatch.setattr(server._driver, "cmd_with_extract", fake_cmd_with_extract)
+
+    result = server._call_tool("addr_context", {"name": "mosview"})
+
+    assert calls == ["CLS", "ADDR mosview"]
+    assert result["ok"] is False
+    assert result["parse_error"] == "switch_failed"
+    assert result["parsed"] == {"attempted": "mosview"}
+    assert result["note"] == "Invalid command"
 
 
 def test_bp_set_canonicalizes_selector_offset_and_ignores_noisy_output(monkeypatch):

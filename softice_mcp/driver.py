@@ -1,9 +1,10 @@
-"""Runtime wrapper around the SoftICE serial driver.
+"""Runtime wrapper around the SoftICE PTY driver.
 
-Owns the single pyte-backed transport connection, handles one-shot reconnect
-on bad-fd errors, exposes a ``cmd_with_extract`` primitive that slices command
-output out of the 80x25 grid, and assumes SoftICE starts in a maximized
-command-window layout with the non-command panes disabled by startup settings.
+Owns the single pyte-backed transport connection (a UNIX PTY served by 86Box's
+Virtual Console backend), handles one-shot reconnect on bad-fd errors,
+exposes a ``cmd_with_extract`` primitive that slices command output out of the
+80x25 grid, and assumes SoftICE starts in a maximized command-window layout
+with the non-command panes disabled by startup settings.
 """
 
 from __future__ import annotations
@@ -81,8 +82,8 @@ class SoftICEDriver:
         if self._path is None:
             raise SoftICEStateError(
                 "Not connected. Call `connect(path=...)` with the 86Box "
-                "Named Pipe / UNIX FIFO base path (e.g. /tmp/softice) "
-                "before issuing commands."
+                "Virtual Console PTY path "
+                "(e.g. /tmp/softice_host or /dev/pts/12) before issuing commands."
             )
         sice = SoftICE(path=self._path)
         sice.open()
@@ -392,7 +393,6 @@ class SoftICEDriver:
             s = self.ensure_open()
             raw_rows = s.render()
             cursor = [s.screen.cursor.y, s.screen.cursor.x]
-            # outside the window context: raw_rows captured inside; snapshot
             final_rows = self.ensure_open().render()
             popped_in = detect_popped_in(
                 final_rows, detect_command_bounds(final_rows, self._bounds)
