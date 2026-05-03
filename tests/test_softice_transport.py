@@ -35,7 +35,7 @@ def test_write_all_retries_until_buffer_is_fully_written(monkeypatch):
     assert attempts == [b"ABCD", b"BCD", b"D"]
 
 
-def test_send_keys_writes_whole_buffer_in_one_call(monkeypatch):
+def test_send_keys_writes_one_byte_per_chunk_with_inter_chunk_sleep(monkeypatch):
     sice = SoftICE("/tmp/softice_host")
     sice.fd = 7
     written: list[bytes] = []
@@ -53,11 +53,31 @@ def test_send_keys_writes_whole_buffer_in_one_call(monkeypatch):
 
     sice.send_keys("ABC")
 
-    assert written == [b"ABC"]
+    assert written == [b"A", b"B", b"C"]
+    assert sleeps == [softice_mod.WRITE_CHUNK_DELAY, softice_mod.WRITE_CHUNK_DELAY]
+
+
+def test_send_keys_single_byte_send_does_not_sleep(monkeypatch):
+    sice = SoftICE("/tmp/softice_host")
+    sice.fd = 7
+    written: list[bytes] = []
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(softice_mod.select, "select", _ready)
+    monkeypatch.setattr(
+        softice_mod.os,
+        "write",
+        lambda _fd, data: written.append(bytes(data)) or len(data),
+    )
+    monkeypatch.setattr(softice_mod.time, "sleep", sleeps.append)
+
+    sice.send_keys(b"\r")
+
+    assert written == [b"\r"]
     assert sleeps == []
 
 
-def test_send_keys_retries_on_eagain_without_pacing(monkeypatch):
+def test_send_keys_retries_eagain_per_chunk(monkeypatch):
     sice = SoftICE("/tmp/softice_host")
     sice.fd = 7
     attempts: list[bytes] = []
@@ -65,11 +85,14 @@ def test_send_keys_retries_on_eagain_without_pacing(monkeypatch):
     events = iter(
         [
             BlockingIOError(errno.EAGAIN, "try again"),
-            3,
+            1,
+            1,
+            1,
         ]
     )
 
     monkeypatch.setattr(softice_mod.select, "select", _ready)
+    monkeypatch.setattr(softice_mod.time, "sleep", lambda _delay: None)
 
     def fake_write(fd: int, data) -> int:
         chunk = bytes(data)
@@ -84,7 +107,7 @@ def test_send_keys_retries_on_eagain_without_pacing(monkeypatch):
 
     sice.send_keys("ABC")
 
-    assert attempts == [b"ABC", b"ABC"]
+    assert attempts == [b"A", b"A", b"B", b"C"]
     assert b"".join(written) == b"ABC"
 
 
@@ -94,6 +117,7 @@ def test_cmd_sends_reset_cr_then_command(monkeypatch):
     sent: list[bytes] = []
     drains: list[tuple[float, float]] = []
 
+    monkeypatch.setattr(softice_mod.time, "sleep", lambda _delay: None)
     monkeypatch.setattr(sice, "_write_all", lambda data: sent.append(bytes(data)))
 
     def fake_drain(timeout: float = 1.5, settle: float = 0.35, is_done=None) -> bytes:
@@ -104,7 +128,9 @@ def test_cmd_sends_reset_cr_then_command(monkeypatch):
 
     raw = sice.cmd("TABLE", timeout=2.0)
 
-    assert sent == [b"\r", b"TABLE\r"]
+    # Per-byte chunking calls _write_all per byte; the primer is one byte,
+    # the command is six (T A B L E \r).
+    assert sent == [b"\r", b"T", b"A", b"B", b"L", b"E", b"\r"]
     assert drains == [(0.3, 0.05), (2.0, 0.35)]
     assert raw == b"screen"
 

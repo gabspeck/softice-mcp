@@ -17,8 +17,10 @@ Public API:
     SoftICE.send_keys(s)             -- raw keystrokes, no terminator
     SoftICE.cmd(line)                -- line + CR, wait for paint to settle
     SoftICE.drain(timeout, settle)   -- passive read
-    SoftICE.screen                   -- pyte.Screen (.display is the grid)
+    SoftICE.screen                   -- pyte.HistoryScreen (.display is the grid)
     SoftICE.render()                 -- list[str] of the 25 rendered rows
+    SoftICE.history_top_len()        -- snapshot the scrollback length
+    SoftICE.render_with_history(n)   -- combined scrollback-since-n + visible
 
 CLI:
     softice.py --path /tmp/softice_host popup
@@ -53,6 +55,16 @@ except ImportError:  # pragma: no cover - Windows fallback
 WRITE_TIMEOUT = 1.0
 BAUD = termios.B115200
 
+# Pace host writes so the guest 16550's 16-byte RX FIFO never overruns.
+# Multi-byte chunks (8, 12) still drop bytes — the kernel coalesces our
+# back-to-back writes into one read on the 86Box side, so the chunk
+# boundary disappears by the time bytes reach the guest UART. Per-byte
+# writes work because 86Box can only read one byte at a time when the
+# PTY only ever holds one. 10 ms is the same delay the FIFO-transport
+# code used; restoring it here for the same reason.
+WRITE_CHUNK_SIZE = 1
+WRITE_CHUNK_DELAY = 0.010
+
 
 class SoftICEBusyError(RuntimeError):
     """Another process already owns the SoftICE PTY transport."""
@@ -62,12 +74,15 @@ class NotATTYError(RuntimeError):
     """Configured transport path is not a character device (PTY)."""
 
 
+SCROLLBACK_LINES = 500
+
+
 class SoftICE:
     def __init__(self, path: str, rows: int = 25, cols: int = 80):
         self.path = path
         self.fd: int | None = None
         self._lock_fd: int | None = None
-        self.screen = pyte.Screen(cols, rows)
+        self.screen = pyte.HistoryScreen(cols, rows, history=SCROLLBACK_LINES, ratio=0.5)
         self.stream = pyte.Stream(self.screen)
 
     def _acquire_lock(self) -> None:
@@ -159,10 +174,14 @@ class SoftICE:
         """Read until no new bytes arrive for `settle` seconds,
         or `timeout` elapses with no data at all.
 
-        When ``is_done`` is supplied, it's invoked after each chunk has been
-        fed into the pyte stream (i.e. only when fresh bytes actually arrived
-        — the no-data path stays cheap). Returning ``True`` exits the loop
-        immediately with whatever has been read so far.
+        When ``is_done`` is supplied it's invoked after each chunk has been
+        fed into the pyte stream (only when fresh bytes actually arrived —
+        the no-data path stays cheap). The first ``True`` return latches:
+        we stop calling the predicate but keep reading for ``settle`` more
+        seconds of quiet so trailing redraws (status bar, cursor parking,
+        repaints SoftICE issues right after the prompt) land on the screen
+        before the next command goes out. Without this, trailing bytes
+        race the next ``send_keys`` and corrupt the next command's output.
 
         A zero-byte read after select reports the fd readable means the PTY
         peer hung up; raise EIO so the driver's reconnect path triggers.
@@ -171,6 +190,7 @@ class SoftICE:
         with span("drain.io") as s:
             data = bytearray()
             end = time.monotonic() + timeout
+            done_at: float | None = None
             while time.monotonic() < end:
                 r, _, _ = select.select([self.fd], [], [], 0.1)
                 if r:
@@ -190,8 +210,12 @@ class SoftICE:
                     # latest bytes when ``is_done`` runs. pyte handles
                     # partial feeds correctly.
                     self.stream.feed(chunk.decode("latin-1"))
-                    if is_done is not None and is_done():
-                        break
+                    if done_at is None and is_done is not None and is_done():
+                        done_at = time.monotonic()
+                    elif done_at is not None:
+                        done_at = time.monotonic()
+                elif done_at is not None and time.monotonic() - done_at >= settle:
+                    break
             s.add(bytes=len(data))
             return bytes(data)
 
@@ -230,18 +254,44 @@ class SoftICE:
             view = view[written:]
 
     def send_keys(self, s: str | bytes) -> None:
-        """Write raw bytes, no terminator added."""
+        """Write raw bytes, no terminator added.
+
+        Splits at ``WRITE_CHUNK_SIZE`` boundaries with a small inter-chunk
+        sleep so we don't overrun the guest 16550's 16-byte RX FIFO. Short
+        commands (≤12 bytes) write in a single shot with no extra latency;
+        long commands (BPX with IF/DO, large macro blocks) pay one ~5 ms
+        gap per ~12 bytes, which is invisible alongside SoftICE's own
+        per-keystroke echo + status-bar repaint cost.
+        """
         assert self.fd is not None
         if isinstance(s, str):
             s = s.encode("latin-1")
         with span("send_keys", n=len(s)):
-            self._write_all(s)
+            view = memoryview(s)
+            first = True
+            while view:
+                if not first:
+                    time.sleep(WRITE_CHUNK_DELAY)
+                chunk = view[:WRITE_CHUNK_SIZE]
+                self._write_all(bytes(chunk))
+                view = view[WRITE_CHUNK_SIZE:]
+                first = False
+
+    def _bottom_prompt_row(self) -> int | None:
+        """Visible-grid index of the bottommost row that strips to ``:``."""
+        cols = self.screen.columns
+        buf = self.screen.buffer
+        for r in range(self.screen.lines - 1, -1, -1):
+            line = "".join(buf[r][x].data for x in range(cols)).strip()
+            if line == ":":
+                return r
+        return None
 
     def cmd(
         self,
         line: str,
         timeout: float = 1.5,
-        is_done: Callable[[], bool] | None = None,
+        is_done: Callable[[int | None, int], Callable[[], bool] | None] | None = None,
     ) -> bytes:
         """Send a SoftICE command + CR, wait for paint, return raw bytes.
 
@@ -250,17 +300,27 @@ class SoftICE:
         Esc — Esc + letter acts as a meta shortcut in SoftICE serial mode
         and swallows the first character of the next command.
 
-        When ``is_done`` is supplied it's plumbed into the final drain so
-        the call can short-circuit as soon as a fresh prompt is detected.
-        The primer drain uses the same predicate — its only job is to absorb
-        the bare-CR's prompt redraw, which is exactly what ``is_done``
-        detects.
+        ``is_done`` is a *factory*: called as
+        ``is_done(prompt_floor, history_marker)`` once before each drain. It
+        returns the actual ``() -> bool`` predicate (or ``None``). The factory
+        runs twice: first as ``(None, history_len)`` for the primer drain
+        (no row floor — any prompt is acceptable), then as
+        ``(floor_row, floor_hist)`` for the main drain where ``floor_row`` is
+        the bottommost ``:`` row visible after the primer settles. Passing the
+        floor lets the predicate reject a stale prompt left over from the
+        primer (or the previous command) and only fire once SoftICE paints a
+        NEW prompt — the absence of pacing on the PTY transport otherwise
+        races the predicate against the in-flight command's first echo.
         """
         with span("softice.cmd", line=line):
             self.send_keys(b"\r")
-            self.drain(0.3, 0.05, is_done=is_done)
+            primer_pred = is_done(None, self.history_top_len()) if is_done else None
+            self.drain(0.3, 0.05, is_done=primer_pred)
+            floor_row = self._bottom_prompt_row()
+            floor_hist = self.history_top_len()
             self.send_keys(line + "\r")
-            return self.drain(timeout=timeout, is_done=is_done)
+            main_pred = is_done(floor_row, floor_hist) if is_done else None
+            return self.drain(timeout=timeout, is_done=main_pred)
 
     def popup(
         self,
@@ -303,6 +363,39 @@ class SoftICE:
                 for y in range(self.screen.lines)
             ]
 
+    def history_top_len(self) -> int:
+        """Snapshot of the scrollback length, used as a marker before a command."""
+        return len(self.screen.history.top)
+
+    def render_with_history(
+        self, since_top_len: int
+    ) -> tuple[list[str], list[bool]]:
+        """Combined scrollback (since marker) + visible rows, plus per-row bold.
+
+        With ``PAUSE OFF`` SoftICE emits long output as a continuous scroll;
+        rows pushed past the top of the visible 25-row grid land in
+        ``screen.history.top``. We slice the history added since the caller
+        snapshotted ``history_top_len()`` and concatenate it with the
+        currently visible rows so command-output extraction can see the whole
+        thing.
+        """
+        with span("pyte.render"):
+            cols = self.screen.columns
+            hist = list(self.screen.history.top)[since_top_len:]
+            hist_rows = [
+                "".join(line[x].data for x in range(cols)).rstrip() for line in hist
+            ]
+            hist_bold = [
+                any(line[x].bold for x in range(cols)) for line in hist
+            ]
+            visible_rows = [row.rstrip() for row in self.screen.display]
+            buf = self.screen.buffer
+            visible_bold = [
+                any(buf[y][x].bold for x in range(cols))
+                for y in range(self.screen.lines)
+            ]
+            return hist_rows + visible_rows, hist_bold + visible_bold
+
     def clear_render_state(self) -> None:
         """Forget the current VT100 screen image.
 
@@ -312,7 +405,9 @@ class SoftICE:
         """
         rows = self.screen.lines
         cols = self.screen.columns
-        self.screen = pyte.Screen(cols, rows)
+        self.screen = pyte.HistoryScreen(
+            cols, rows, history=SCROLLBACK_LINES, ratio=0.5
+        )
         self.stream = pyte.Stream(self.screen)
 
 

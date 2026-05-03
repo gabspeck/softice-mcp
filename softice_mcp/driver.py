@@ -18,15 +18,12 @@ from .parsers import (
     detect_command_bounds,
     detect_popped_in,
     extract_command_output,
-    has_more_pager,
 )
 from .profiling import span
 from .softice import SoftICE
 
 MAXIMIZED_COMMAND_BOUNDS: tuple[int, int] = (0, 24)
 DEFAULT_SEND_KEYS_DRAIN_TIMEOUT = 0.6
-
-MAX_PAGER_STEPS = 32
 
 
 class SoftICEIOError(RuntimeError):
@@ -153,7 +150,9 @@ class SoftICEDriver:
             "cmd",
             line,
             timeout=timeout,
-            is_done=lambda: self._is_prompt_settled(require_cursor=True),
+            is_done=lambda floor, hist: lambda: self._is_prompt_settled(
+                require_cursor=True, prompt_floor=floor, floor_history=hist
+            ),
         )
         return self._snapshot(raw)
 
@@ -186,7 +185,13 @@ class SoftICEDriver:
         )
         return self._snapshot(raw)
 
-    def _is_prompt_settled(self, *, require_cursor: bool) -> bool:
+    def _is_prompt_settled(
+        self,
+        *,
+        require_cursor: bool,
+        prompt_floor: int | None = None,
+        floor_history: int = 0,
+    ) -> bool:
         """True iff the rendered grid currently shows a fresh ``:`` prompt
         at the bottom of the Command window.
 
@@ -196,10 +201,26 @@ class SoftICEDriver:
         also require that pyte's cursor is parked on the prompt row, which
         avoids a false positive where a stale ``:`` prompt is still visible
         from a previous turn.
+
+        ``prompt_floor`` (with ``floor_history``) lets the caller pin a
+        baseline: the bottommost ``:`` row index at the moment the predicate
+        was issued, plus the scrollback length at that moment. The check
+        accepts a prompt only when it sits STRICTLY BELOW the (possibly
+        scrolled) floor, so the predicate doesn't false-fire on the prompt
+        the previous command (or the cmd primer) left behind. If the screen
+        scrolled enough that the floor row has moved off the visible grid
+        into history, the constraint is dropped — any visible prompt is by
+        definition new.
         """
         sice = self._sice
         if sice is None or sice.fd is None:
             return False
+        effective_floor = prompt_floor
+        if effective_floor is not None:
+            history_growth = sice.history_top_len() - floor_history
+            effective_floor -= history_growth
+            if effective_floor < 0:
+                effective_floor = None
         rows = sice.render()
         top, bot = self._bounds
         top = max(0, top)
@@ -215,6 +236,8 @@ class SoftICEDriver:
             if "Enter a command" in stripped:
                 continue
             if stripped == ":":
+                if effective_floor is not None and r <= effective_floor:
+                    return False
                 if require_cursor and sice.screen.cursor.y != r:
                     return False
                 return True
@@ -341,75 +364,63 @@ class SoftICEDriver:
         *,
         timeout: float = 1.5,
     ) -> dict[str, Any]:
-        """Send a command, extract its output, auto-page through ``More?``."""
+        """Send a command, drain to a fresh prompt, extract its full output.
+
+        Assumes SoftICE has ``PAUSE OFF`` so output streams without the
+        interactive ``More?`` pager. Long output that scrolls past the
+        visible 25-row grid is recovered from the pyte ``HistoryScreen``
+        scrollback so ``command_rows`` always reflects the complete capture
+        (up to the configured scrollback depth).
+        """
         with span("cmd_with_extract", line=line):
             with span("ensure_popped"):
                 self.ensure_popped()
-            with span("render.pre"):
-                pre_rows = self.ensure_open().render()
-            raw = bytearray()
-            raw.extend(
-                self._retry_once(
-                    "cmd",
-                    line,
-                    timeout=timeout,
-                    is_done=lambda: self._is_prompt_settled(require_cursor=True),
-                )
-            )
-            command_rows: list[str] = []
-            command_rows_bold: list[bool] = []
-            parse_error: str | None = None
-            steps = 0
-            bounds = self._bounds
-            while True:
-                with span("page_iter", step=steps) as ps:
-                    s = self.ensure_open()
-                    with span("render.loop"):
-                        rows = s.render()
-                        bold = s.render_bold()
-                    with span("detect.bounds"):
-                        bounds = detect_command_bounds(rows, self._bounds)
-                    with span("extract"):
-                        page_rows, parse_error, page_idx = extract_command_output(
-                            rows, line if steps == 0 else "", bounds, s.screen.cursor.y
-                        )
-                    ps.add(rows=len(page_rows))
-                    command_rows.extend(page_rows)
-                    command_rows_bold.extend(bold[i] for i in page_idx)
-                    with span("has_more"):
-                        more = has_more_pager(rows, bounds)
-                    if not more or steps >= MAX_PAGER_STEPS:
-                        break
-                    raw.extend(self._retry_once("send_keys", b" ") or b"")
-                    raw.extend(
-                        self._retry_once(
-                            "drain",
-                            1.0,
-                            0.2,
-                            is_done=lambda: self._is_prompt_settled(require_cursor=False),
-                        )
-                    )
-                    steps += 1
             s = self.ensure_open()
-            raw_rows = s.render()
-            cursor = [s.screen.cursor.y, s.screen.cursor.x]
-            final_rows = self.ensure_open().render()
-            popped_in = detect_popped_in(
-                final_rows, detect_command_bounds(final_rows, self._bounds)
+            with span("render.pre"):
+                pre_rows = s.render()
+            history_marker = s.history_top_len()
+
+            raw = self._retry_once(
+                "cmd",
+                line,
+                timeout=timeout,
+                is_done=lambda floor, hist: lambda: self._is_prompt_settled(
+                    require_cursor=True, prompt_floor=floor, floor_history=hist
+                ),
             )
+
+            s = self.ensure_open()
+            with span("render.combined"):
+                combined_rows, combined_bold = s.render_with_history(history_marker)
+            visible_rows = combined_rows[-s.screen.lines:]
+            with span("detect.bounds"):
+                chrome_bounds = detect_command_bounds(visible_rows, self._bounds)
+            history_rows = len(combined_rows) - s.screen.lines
+            combined_bot = history_rows + chrome_bounds[1]
+            with span("extract"):
+                page_rows, parse_error, page_idx = extract_command_output(
+                    combined_rows,
+                    line,
+                    (0, combined_bot),
+                    s.screen.cursor.y + history_rows,
+                )
+            command_rows_bold = [combined_bold[i] for i in page_idx]
+
+            cursor = [s.screen.cursor.y, s.screen.cursor.x]
+            final_rows = visible_rows
+            popped_in = detect_popped_in(final_rows, chrome_bounds)
             return {
                 "line": line,
                 "raw": bytes(raw),
-                "raw_rows": raw_rows,
+                "raw_rows": final_rows,
                 "pre_rows": pre_rows,
                 "final_rows": final_rows,
                 "cursor": cursor,
-                "bounds": list(bounds),
-                "command_rows": command_rows,
+                "bounds": list(chrome_bounds),
+                "command_rows": page_rows,
                 "command_rows_bold": command_rows_bold,
                 "parse_error": parse_error,
                 "popped_in": popped_in,
-                "pager_steps": steps,
             }
 
     # ---- helpers -----------------------------------------------------

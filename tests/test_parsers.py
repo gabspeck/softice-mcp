@@ -3,7 +3,6 @@ from __future__ import annotations
 from softice_mcp.parsers import (
     detect_popped_in,
     extract_command_output,
-    has_more_pager,
     parse_addr_table,
     parse_breakpoint_list,
     parse_disasm,
@@ -130,38 +129,10 @@ class TestExtractCommandOutput:
         assert err is None
         assert out == ["00) BPX 0030:00401000"]
 
-    def test_pager_marker_as_prompt(self):
-        """When SoftICE's pager is active, the bottom row shows `More?` (or
-        `press any key`) instead of a bare `:` prompt. The extractor must
-        accept that as a terminator so cmd_with_extract's paging loop gets
-        the current page's output."""
-        rows = make_grid(
-            [
-                ":BL",
-                "00) BPX 0030:00401000",
-                "01) BPX 0030:00402000",
-                "02) BPX 0030:00403000",
-                "03) BPX 0030:00404000",
-                "04) BPX 0030:00405000",
-                "05) BPX 0030:00406000",
-                "More?",
-            ]
-        )
-        out, err, _ = extract_command_output(rows, "BL", (17, 24), cursor_row=24)
-        assert err is None
-        assert out == [
-            "00) BPX 0030:00401000",
-            "01) BPX 0030:00402000",
-            "02) BPX 0030:00403000",
-            "03) BPX 0030:00404000",
-            "04) BPX 0030:00405000",
-            "05) BPX 0030:00406000",
-        ]
-
     def test_prompt_not_found_when_cursor_mid_output(self):
-        """If the drain returned before SoftICE painted a fresh prompt or a
-        pager marker, the extractor must fail loudly rather than silently
-        anchoring on a `:COMMAND` echo higher up."""
+        """If the drain returned before SoftICE painted a fresh `:` prompt,
+        the extractor must fail loudly rather than silently anchoring on a
+        `:COMMAND` echo higher up."""
         rows = make_grid(
             [
                 ":BL",
@@ -233,20 +204,6 @@ class TestDetectPoppedIn:
         rows[21] = ":".ljust(80)
         rows[22] = "     Enter a command (H for help)                      KERNEL32".ljust(80)
         assert detect_popped_in(rows, (17, 24)) is True
-
-
-class TestHasMorePager:
-    def test_more_marker(self):
-        rows = make_grid(["foo", "bar", "More?", "", "", "", "", ""])
-        assert has_more_pager(rows, (17, 24)) is True
-
-    def test_press_any_key(self):
-        rows = make_grid(["foo", "press any key to continue", "", "", "", "", "", ""])
-        assert has_more_pager(rows, (17, 24)) is True
-
-    def test_none(self):
-        rows = make_grid([":", "", "", "", "", "", "", ""])
-        assert has_more_pager(rows, (17, 24)) is False
 
 
 # ---- register dump -------------------------------------------------------

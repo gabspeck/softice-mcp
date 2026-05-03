@@ -143,7 +143,6 @@ def _raw_envelope(
         "cursor": snapshot.get("cursor"),
         "bounds": snapshot.get("bounds"),
         "popped_in": snapshot.get("popped_in"),
-        "pager_steps": snapshot.get("pager_steps", 0),
         "line": snapshot.get("line"),
     }
     if note:
@@ -178,9 +177,6 @@ def _parsed_envelope(
     line = snapshot.get("line")
     if line:
         env["line"] = line
-    pager = snapshot.get("pager_steps") or 0
-    if pager:
-        env["pager_steps"] = pager
     if note:
         env["note"] = note
     if parse_error is not None:

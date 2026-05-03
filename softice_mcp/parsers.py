@@ -64,12 +64,9 @@ def extract_command_output(
             if stripped == ":":
                 prompt_row = r
                 break
-            if stripped.endswith("More?") or "press any key" in stripped.lower():
-                prompt_row = r
-                break
-            # First non-skippable row isn't a prompt or pager marker — SoftICE
-            # hasn't painted a fresh prompt yet. Fail loudly instead of silently
-            # latching onto a stale echo higher up.
+            # First non-skippable row isn't a fresh `:` prompt — SoftICE hasn't
+            # finished painting yet. Fail loudly instead of silently latching
+            # onto a stale echo higher up.
             break
         if prompt_row is None:
             return [], "prompt_not_found", []
@@ -184,20 +181,6 @@ def detect_popped_in(rows: Grid, bounds: tuple[int, int]) -> bool:
             if "Enter a command" in stripped:
                 continue
             return stripped == ":"
-        return False
-
-
-def has_more_pager(rows: Grid, bounds: tuple[int, int]) -> bool:
-    """SoftICE's long-output pager prints 'Press any key...' or 'More?'.
-
-    We match either token at end-of-line inside the Command window.
-    """
-    with span("parser.has_more_pager", rows=len(rows)):
-        top, bot = bounds
-        for r in range(max(0, top), min(bot + 1, len(rows))):
-            stripped = rows[r].strip()
-            if stripped.endswith("More?") or "press any key" in stripped.lower():
-                return True
         return False
 
 

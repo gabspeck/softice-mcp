@@ -7,11 +7,15 @@ structured tools to the Claude Code LLM.
 
 ## Prerequisites
 
-1. 86Box VM running Windows 95 with SoftICE configured for serial VT100:
+1. 86Box VM running Windows 95 with SoftICE configured for serial VT100 with
+   pagination disabled:
    ```
    SERIAL ON 1 115200
    DISPLAY VT100
+   PAUSE OFF
    ```
+   `PAUSE OFF` disables SoftICE's interactive `More?` pager — softice-mcp
+   captures long output via VT100 scrollback instead.
 2. 86Box COM1 configured as `Virtual Console`. 86Box allocates the PTY pair
    itself and exposes the host side at the path you configure
    (`/tmp/softice_host` is the convention this server's docs assume). Boot the
